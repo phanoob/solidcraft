@@ -114,10 +114,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, proj: &Proj) {
         {
             app.viewport.insert_drag = Some(Drag { part, from, at: (place.x, place.y, place.scale, place.angle) });
         }
-        if response.dragged()
+        // The release frame carries the last move too: it counts, or a quick drag stops short.
+        if (response.dragged() || response.drag_stopped())
             && let Some(drag) = app.viewport.insert_drag.clone()
             && drag.part == part
-            && let Some(p) = response.interact_pointer_pos().and_then(|p| pointer_on_sketch(&plane, proj, p))
+            && let Some(p) =
+                response.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos())).and_then(|p| pointer_on_sketch(&plane, proj, p))
         {
             let snap = ui.input(|i| i.modifiers.shift);
             if let Some(Kind::InsertDrawing(target)) = app.dialog.as_mut().map(|d| &mut d.kind) {
