@@ -1,5 +1,6 @@
-//! Insert SVG / Insert DXF: once the file is picked, the drawing is placed on the sketch (an
-//! offset and a scale) with a live preview, and OK adds it (#2605, #3443).
+//! Insert SVG / Insert DXF: once the file is picked, the drawing is placed on the sketch (where
+//! its middle goes, its size in millimetres or as a factor, and an angle) with a live preview,
+//! and OK adds it (#2605, #3443).
 
 use serde_json::{Value, json};
 
@@ -9,7 +10,8 @@ use crate::dialogs::{Dialog, Kind, form_row};
 /// Largest scale the insert commands take.
 const MAX_SCALE: f64 = 1e5;
 
-/// The drawing being placed: the insert command, its file, and where and how big it goes.
+/// The drawing being placed: the insert command, its file, and where, how big and how turned
+/// it goes. `x` and `y` are where the drawing's middle lands; it scales and turns about it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Place {
     pub command: String,
@@ -17,11 +19,24 @@ pub struct Place {
     pub x: f64,
     pub y: f64,
     pub scale: f64,
+    /// Degrees, counter-clockwise.
+    pub angle: f64,
+    /// The drawing's own width and height in the file, when it could be read.
+    pub natural: Option<(f64, f64)>,
 }
 
 /// Open the placement for `path`, picked for `command` (`sketch.insert_svg` / `_dxf`).
 pub fn open(app: &mut SolveApp, command: &str, path: String) {
-    app.dialog = Some(Dialog::new(Kind::InsertDrawing(Place { command: command.to_string(), path, x: 0.0, y: 0.0, scale: 1.0 }), Vec::new()));
+    let natural = app
+        .session
+        .execute("sketch.drawing_bounds", &json!({"path": path, "format": if command.ends_with("dxf") { "dxf" } else { "svg" }}))
+        .ok()
+        .and_then(|b| Some((b.get("width")?.as_f64()?, b.get("height")?.as_f64()?)))
+        .filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 1e-9 && *h > 1e-9);
+    app.dialog = Some(Dialog::new(
+        Kind::InsertDrawing(Place { command: command.to_string(), path, x: 0.0, y: 0.0, scale: 1.0, angle: 0.0, natural }),
+        Vec::new(),
+    ));
 }
 
 pub fn title(p: &Place) -> &'static str {
@@ -39,9 +54,26 @@ pub fn rows(ui: &mut egui::Ui, p: &mut Place) {
             crate::scenario::publish_handle(handle, r.rect.center());
         });
     }
+    // The size in millimetres follows the scale and the other way round; the aspect is kept.
+    if let Some((nw, nh)) = p.natural {
+        for (label, natural, handle) in [("Width", nw, "dialog:insert:width"), ("Height", nh, "dialog:insert:height")] {
+            form_row(ui, label, |ui| {
+                let mut mm = natural * p.scale;
+                let r = crate::ui_kit::number_field(ui, &mut mm, 0.001..=natural * MAX_SCALE, 0.5, " mm");
+                if r.changed() && mm.is_finite() && mm > 0.0 {
+                    p.scale = (mm / natural).clamp(0.0001, MAX_SCALE);
+                }
+                crate::scenario::publish_handle(handle, r.rect.center());
+            });
+        }
+    }
     form_row(ui, "Scale", |ui| {
         let r = crate::ui_kit::number_field(ui, &mut p.scale, 0.0001..=MAX_SCALE, 0.01, "");
         crate::scenario::publish_handle("dialog:insert:scale", r.rect.center());
+    });
+    form_row(ui, "Angle", |ui| {
+        let r = crate::ui_kit::number_field(ui, &mut p.angle, -360.0..=360.0, 1.0, "\u{b0}");
+        crate::scenario::publish_handle("dialog:insert:angle", r.rect.center());
     });
 }
 
@@ -53,7 +85,10 @@ pub fn commands(p: &Place) -> Result<Vec<(String, Value)>, String> {
     if !(p.scale.is_finite() && p.scale > 1e-9 && p.scale <= MAX_SCALE) {
         return Err("the scale must be above 0".into());
     }
-    Ok(vec![(p.command.clone(), json!({"path": p.path, "at": [p.x, p.y], "scale": p.scale}))])
+    if !p.angle.is_finite() {
+        return Err("the angle must be a number".into());
+    }
+    Ok(vec![(p.command.clone(), json!({"path": p.path, "at": [p.x, p.y], "scale": p.scale, "angle": p.angle, "align": "center"}))])
 }
 
 #[cfg(test)]
@@ -93,7 +128,7 @@ mod tests {
         h.app.start("sketch.insert_svg");
         h.frames(3);
         let Some(Kind::InsertDrawing(p)) = h.app.dialog.as_ref().map(|d| d.kind.clone()) else { panic!("no placement: {:?}", h.app.status) };
-        assert_eq!((p.path.as_str(), p.x, p.y, p.scale), (path.as_str(), 0.0, 0.0, 1.0));
+        assert_eq!((p.path.as_str(), p.x, p.y, p.scale, p.angle, p.natural), (path.as_str(), 0.0, 0.0, 1.0, 0.0, Some((20.0, 10.0))));
         assert!(handle_at("dialog:insert:scale").is_some(), "the scale is drawn");
         assert!(lines(&h).is_empty(), "nothing is added before OK");
         // The drawing is previewed where it would go.
@@ -109,10 +144,36 @@ mod tests {
         let (lo_x, hi_x) = pts.iter().fold((f64::MAX, f64::MIN), |(l, u), p| (l.min(p.x), u.max(p.x)));
         let (lo_y, hi_y) = pts.iter().fold((f64::MAX, f64::MIN), |(l, u), p| (l.min(p.y), u.max(p.y)));
         assert!((hi_x - lo_x - 40.0).abs() < 1e-6 && (hi_y - lo_y - 20.0).abs() < 1e-6, "twice its size: {lo_x}..{hi_x} × {lo_y}..{hi_y}");
-        assert!((lo_x - 5.0).abs() < 1e-6, "moved by X: {lo_x}");
+        assert!(((lo_x + hi_x) / 2.0 - 5.0).abs() < 1e-6, "its middle is at X: {lo_x}..{hi_x}");
+        assert!(((lo_y + hi_y) / 2.0 + 3.0).abs() < 1e-6, "its middle is at Y: {lo_y}..{hi_y}");
         h.app.run("edit.undo", json!({})).unwrap();
         h.settle();
         assert!(lines(&h).is_empty(), "one undo removes the drawing");
+    }
+
+    /// The width in millimetres sets the scale, and the angle turns the drawing about its middle.
+    #[test]
+    fn a_width_and_an_angle_size_and_turn_the_drawing_about_its_middle() {
+        let mut h = Harness::new();
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.settle();
+        open(&mut h.app, "sketch.insert_svg", svg_file("turned.svg"));
+        h.frames(2);
+        assert!(handle_at("dialog:insert:width").is_some() && handle_at("dialog:insert:angle").is_some(), "the new fields are drawn");
+        if let Some(Kind::InsertDrawing(p)) = h.app.dialog.as_mut().map(|d| &mut d.kind) {
+            let (nw, _) = p.natural.unwrap();
+            // 40 mm wide, as the Width field sets it, turned a quarter, middle at (5, -3).
+            p.scale = 40.0 / nw;
+            (p.x, p.y, p.angle) = (5.0, -3.0, 90.0);
+        }
+        h.step(&json!({"key": "Enter"})).unwrap();
+        h.settle();
+        assert!(h.app.dialog.is_none());
+        let pts: Vec<_> = lines(&h).into_iter().flat_map(|(a, b)| [a, b]).collect();
+        let (lo_x, hi_x) = pts.iter().fold((f64::MAX, f64::MIN), |(l, u), p| (l.min(p.x), u.max(p.x)));
+        let (lo_y, hi_y) = pts.iter().fold((f64::MAX, f64::MIN), |(l, u), p| (l.min(p.y), u.max(p.y)));
+        assert!((hi_x - lo_x - 20.0).abs() < 1e-6 && (hi_y - lo_y - 40.0).abs() < 1e-6, "turned: {lo_x}..{hi_x} x {lo_y}..{hi_y}");
+        assert!(((lo_x + hi_x) / 2.0 - 5.0).abs() < 1e-6 && ((lo_y + hi_y) / 2.0 + 3.0).abs() < 1e-6, "about its middle");
     }
 
     /// Cancel adds nothing; a bad scale is refused.
@@ -123,7 +184,7 @@ mod tests {
         h.settle();
         open(&mut h.app, "sketch.insert_svg", svg_file("cancel.svg"));
         h.frames(2);
-        let bad = Place { command: "sketch.insert_svg".into(), path: "x.svg".into(), x: 0.0, y: 0.0, scale: 0.0 };
+        let bad = Place { command: "sketch.insert_svg".into(), path: "x.svg".into(), x: 0.0, y: 0.0, scale: 0.0, angle: 0.0, natural: None };
         assert!(commands(&bad).is_err());
         h.step(&json!({"key": "Escape"})).unwrap();
         h.settle();
