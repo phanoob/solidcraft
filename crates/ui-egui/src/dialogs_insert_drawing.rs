@@ -8,7 +8,7 @@ use crate::SolveApp;
 use crate::dialogs::{Dialog, Kind, form_row};
 
 /// Largest scale the insert commands take.
-const MAX_SCALE: f64 = 1e5;
+pub(crate) const MAX_SCALE: f64 = 1e5;
 
 /// The drawing being placed: the insert command, its file, and where, how big and how turned
 /// it goes. `x` and `y` are where the drawing's middle lands; it scales and turns about it.
@@ -174,6 +174,38 @@ mod tests {
         let (lo_y, hi_y) = pts.iter().fold((f64::MAX, f64::MIN), |(l, u), p| (l.min(p.y), u.max(p.y)));
         assert!((hi_x - lo_x - 20.0).abs() < 1e-6 && (hi_y - lo_y - 40.0).abs() < 1e-6, "turned: {lo_x}..{hi_x} x {lo_y}..{hi_y}");
         assert!(((lo_x + hi_x) / 2.0 - 5.0).abs() < 1e-6 && ((lo_y + hi_y) / 2.0 + 3.0).abs() < 1e-6, "about its middle");
+    }
+
+    /// The drawing's handles in the viewport edit the same values: a corner scales about the
+    /// opposite one, the box moves, and the knob turns.
+    #[test]
+    fn the_handles_in_the_viewport_scale_move_and_turn_the_drawing() {
+        let mut h = Harness::new();
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.step(&json!({"call": "ui.view", "params": {"view": "top"}})).unwrap();
+        h.settle();
+        open(&mut h.app, "sketch.insert_svg", svg_file("handles.svg"));
+        h.frames(4);
+        let place = |h: &Harness| match h.app.dialog.as_ref().map(|d| d.kind.clone()) {
+            Some(Kind::InsertDrawing(p)) => p,
+            other => panic!("no placement: {other:?}"),
+        };
+        // The corner at (+10, +5) dragged to (+30, +15): twice the size, the corner at (-10, -5) stays.
+        h.step(&json!({"drag": [{"handle": "insert:handle:3"}, {"world": [30, 15, 0]}]})).unwrap();
+        h.frames(3);
+        let p = place(&h);
+        assert!((p.scale - 2.0).abs() < 0.05, "scaled: {}", p.scale);
+        assert!((p.x - 10.0).abs() < 0.5 && (p.y - 5.0).abs() < 0.5, "about the far corner: {}, {}", p.x, p.y);
+        // The box dragged by its middle by (+5, -4).
+        let (x, y) = (p.x, p.y);
+        h.step(&json!({"drag": [{"world": [x, y, 0]}, {"world": [x + 5.0, y - 4.0, 0]}]})).unwrap();
+        h.frames(3);
+        let p = place(&h);
+        assert!((p.x - x - 5.0).abs() < 0.5 && (p.y - y + 4.0).abs() < 0.5, "moved: {}, {}", p.x, p.y);
+        // The knob above the box, dragged to the left of the middle: a quarter turn.
+        h.step(&json!({"drag": [{"handle": "insert:handle:5"}, {"world": [p.x - 30.0, p.y, 0]}]})).unwrap();
+        h.frames(3);
+        assert!((place(&h).angle - 90.0).abs() < 2.0, "turned: {}", place(&h).angle);
     }
 
     /// Cancel adds nothing; a bad scale is refused.

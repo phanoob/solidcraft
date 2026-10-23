@@ -84,6 +84,7 @@ mod i18n_ui_tests;
 pub mod icon_svg;
 pub mod icons;
 pub mod inference;
+pub mod insert_handles;
 pub mod install;
 pub mod issue_report;
 pub mod joint_drag;
