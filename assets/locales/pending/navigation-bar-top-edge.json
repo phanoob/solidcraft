@@ -23,5 +23,30 @@
     "navbar.custom.edge": "Borde",
     "navbar.custom.edge_bottom": "Abajo",
     "navbar.custom.edge_top": "Arriba"
+  },
+  "ar": {
+    "navbar.custom.edge": "الحافة",
+    "navbar.custom.edge_bottom": "أسفل",
+    "navbar.custom.edge_top": "أعلى"
+  },
+  "he": {
+    "navbar.custom.edge": "קצה",
+    "navbar.custom.edge_bottom": "למטה",
+    "navbar.custom.edge_top": "למעלה"
+  },
+  "ja": {
+    "navbar.custom.edge": "端",
+    "navbar.custom.edge_bottom": "下",
+    "navbar.custom.edge_top": "上"
+  },
+  "vi": {
+    "navbar.custom.edge": "Cạnh",
+    "navbar.custom.edge_bottom": "Dưới",
+    "navbar.custom.edge_top": "Trên"
+  },
+  "zh": {
+    "navbar.custom.edge": "边缘",
+    "navbar.custom.edge_bottom": "底部",
+    "navbar.custom.edge_top": "顶部"
   }
 }
