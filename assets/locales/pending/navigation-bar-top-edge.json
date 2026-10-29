@@ -1,0 +1,27 @@
+{
+  "en": {
+    "navbar.custom.edge": "Edge",
+    "navbar.custom.edge_bottom": "Bottom",
+    "navbar.custom.edge_top": "Top"
+  },
+  "fr": {
+    "navbar.custom.edge": "Bord",
+    "navbar.custom.edge_bottom": "Bas",
+    "navbar.custom.edge_top": "Haut"
+  },
+  "de": {
+    "navbar.custom.edge": "Rand",
+    "navbar.custom.edge_bottom": "Unten",
+    "navbar.custom.edge_top": "Oben"
+  },
+  "it": {
+    "navbar.custom.edge": "Bordo",
+    "navbar.custom.edge_bottom": "In basso",
+    "navbar.custom.edge_top": "In alto"
+  },
+  "es": {
+    "navbar.custom.edge": "Borde",
+    "navbar.custom.edge_bottom": "Abajo",
+    "navbar.custom.edge_top": "Arriba"
+  }
+}
