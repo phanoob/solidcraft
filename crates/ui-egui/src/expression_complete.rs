@@ -713,6 +713,19 @@ mod tests {
         typed.key(Key::ArrowDown);
         assert!(typed.leaked.contains(&Key::ArrowDown), "a box with text keeps Down for itself");
         assert_eq!(typed.popup(), None);
+
+        // Preferences caps the list, so a large design does not list thousands; a hand-edited
+        // cap below the accepted range still lists a few.
+        for (cap, listed) in [(12, 12), (0, 5)] {
+            let mut capped = Editor::new("");
+            for i in 1..=15 {
+                capped.app.run("parameters.add", json!({"name":format!("p{i:02}"),"expression":"1 mm"})).unwrap();
+            }
+            capped.app.preferences.parameter_list_rows = cap;
+            capped.key(Key::ArrowDown);
+            capped.frame(Vec::new());
+            assert_eq!(capped.popup(), Some((listed, true)), "cap {cap}");
+        }
     }
 
     #[test]

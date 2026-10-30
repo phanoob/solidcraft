@@ -1,0 +1,10 @@
+{
+  "en": {
+    "prefs.parameter_list_rows": "Parameters listed by Down arrow",
+    "prefs.parameter_list_rows_tip": "Down arrow in an empty value field lists the parameters, favourites first, up to this many. Fewer keeps the list light in a large design."
+  },
+  "fr": {
+    "prefs.parameter_list_rows": "Paramètres listés par flèche bas",
+    "prefs.parameter_list_rows_tip": "La flèche bas dans un champ de valeur vide liste les paramètres, favoris en premier, jusqu'à ce nombre. Moins allège la liste dans un gros design."
+  }
+}
