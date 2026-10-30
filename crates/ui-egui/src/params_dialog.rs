@@ -802,6 +802,13 @@ pub(crate) fn suggestions_for(ctx: &egui::Context, word: &str, explicit: bool) -
     all.iter().filter(|s| starts(s) && offered(s)).chain(all.iter().filter(|s| within(s) && offered(s))).take(8).cloned().collect()
 }
 
+/// Every named parameter, in the order the list offers them, with no cap: what Down arrow in
+/// an empty expression box shows (#9246).
+pub(crate) fn every_parameter(ctx: &egui::Context) -> Vec<Suggestion> {
+    let all = ctx.data(|d| d.get_temp::<Cache>(cache_id())).map(|c| c.all).unwrap_or_default();
+    all.iter().filter(|s| s.kind == "parameter").cloned().collect()
+}
+
 /// Is `word` itself one of the known tokens (a parameter or dimension name, a constant or a
 /// unit)? Such a word is ready to submit as typed; the popup then only offers longer names.
 pub(crate) fn exact_token(ctx: &egui::Context, word: &str) -> bool {
