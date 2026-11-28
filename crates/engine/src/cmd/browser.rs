@@ -20,10 +20,11 @@ use crate::params::{bad, bool_, expr, str_};
 use crate::schema::browser::{
     BodyRenameParams, BodyRenamed, BrowserFoldParams, BrowserFoldResult, BrowserGroupMade, BrowserGroupParams, BrowserGroupRenamed,
     BrowserMoveParams, BrowserMoved, BrowserOrderParams, BrowserOrdered, BrowserRenameGroupParams, BrowserUngroupParams, BrowserUngrouped,
-    BrowserVisibilityParams, BrowserVisibilityResult, DocumentUnitsParams, DocumentUnitsResult, FindParams, FindResult, FlipAxis, Isolated,
-    PlaneFrame, PlaneSizeParams, PlaneSized, RedefineAttachment, RedefineSketchParams, RedefineSketchResult, RenamedBody, RepairDone, RepairFace,
-    RepairHole, RepairParams, RepairResult, RepairSewn, ViewApplyParams, ViewDeleteParams, ViewDeleted, ViewListParams, ViewListResult,
-    ViewRenameParams, ViewRenamed, ViewSaveParams, ViewSaved, VisibilityState,
+    BrowserVisibilityParams, BrowserVisibilityResult, DocumentUnitsParams, DocumentUnitsResult, FindParams, FindResult, FlipAxis, FrameFaceParam,
+    Isolated, PlaneFrame, PlaneSizeParams, PlaneSized, RedefineAttachment, RedefineSketchParams, RedefineSketchResult, RenamedBody, RepairDone,
+    RepairFace, RepairHole, RepairParams, RepairResult, RepairSewn, ViewApplyParams, ViewDeleteParams, ViewDeleted, ViewFrameParams, ViewFrameResult,
+    ViewHome, ViewListParams, ViewListResult, ViewRenameParams, ViewRenamed, ViewResetHomeParams, ViewSaveParams, ViewSaved, ViewSetHomeParams,
+    VisibilityState,
 };
 use crate::schema::view_navigation::CameraReply;
 use crate::schema::{TypedContract, output_schema_for};
@@ -48,7 +49,10 @@ const VIEW_RENAME_CONTRACT: TypedContract<ViewRenameParams> = TypedContract::new
 const VIEW_DELETE_CONTRACT: TypedContract<ViewDeleteParams> = TypedContract::new();
 const VIEW_LIST_CONTRACT: TypedContract<ViewListParams> = TypedContract::new();
 const VIEW_APPLY_CONTRACT: TypedContract<ViewApplyParams> = TypedContract::new();
+const VIEW_SET_HOME_CONTRACT: TypedContract<ViewSetHomeParams> = TypedContract::new();
+const VIEW_RESET_HOME_CONTRACT: TypedContract<ViewResetHomeParams> = TypedContract::new();
 const PLANE_SIZE_CONTRACT: TypedContract<PlaneSizeParams> = TypedContract::new();
+const VIEW_FRAME_CONTRACT: TypedContract<ViewFrameParams> = TypedContract::new();
 
 /// A reply as JSON: the commands here build their replies from the types their output schemas
 /// describe, so the two can't drift apart.
@@ -123,6 +127,17 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&VIEW_DELETE_CONTRACT)
         .output(output_schema_for::<ViewDeleted>)
         .params("view: name"),
+    CommandSpec::new("view.set_home", "Set Current View as Home", crate::checked!("view.set_home", view_set_home))
+        .icon("home")
+        .contract(&VIEW_SET_HOME_CONTRACT)
+        .output(output_schema_for::<ViewHome>)
+        .params("camera: {target: [x,y,z], yaw, pitch, distance, fov?, roll?, up?: z|y} (Home goes to it, saved with the design; replaces the Home view set before)"),
+    CommandSpec::new("view.reset_home", "Reset Home View", crate::checked!("view.reset_home", view_reset_home))
+        .icon("home")
+        .contract(&VIEW_RESET_HOME_CONTRACT)
+        .output(output_schema_for::<ViewHome>)
+        .enabled(has_home_view)
+        .params("(none) Home frames the model from the iso view again"),
     CommandSpec::new("view.list", "List Named Views", crate::checked!("view.list", view_list))
         .icon("list")
         .noundo()
@@ -135,7 +150,17 @@ pub static COMMANDS: &[CommandSpec] = &[
         .contract(&VIEW_APPLY_CONTRACT)
         .output(output_schema_for::<CameraReply>)
         .params(
-        "view?: front|back|top|bottom|left|right|iso|home (frames the model) | a named view's name; or camera?: {target: [x,y,z], yaw, pitch, distance, fov?, roll?} (radians, mm, about the up axis; yaw: heading of the line of sight, 0 along +Y (Front), π/2 along +X (Left), π (Back), −π/2 (Right); pitch: the eye's elevation, within ±π/2, π/2 = Top; roll defaults to 0, turns the picture clockwise, must be finite and is clamped to ±π; the View angles readout shows these in degrees; up is refused: the up axis comes from the design settings) → camera. The viewport (and the MCP screenshot) moves there. View state: not saved, not an undo step",
+        "view?: front|back|top|bottom|left|right|iso|home (frames the model) | a named view's name; or camera?: {target: [x,y,z], yaw, pitch, distance, fov?, roll?} (radians, mm, about the frame the camera is in: the design's own FRONT and TOP when it has them, else its up axis; yaw: heading of the line of sight, 0 along +Y (Front), π/2 along +X (Left), π (Back), −π/2 (Right); pitch: the eye's elevation, within ±π/2, π/2 = Top; roll defaults to 0, turns the picture clockwise, must be finite and is clamped to ±π; frame? is the design frame the angles are in (as ui.camera and the view commands give it; null or missing: the design's current frame); the View angles readout shows these in degrees; up is refused: the up axis comes from the design settings) → camera. The viewport (and the MCP screenshot) moves there. View state: not saved, not an undo step",
+    ),
+    CommandSpec::new("view.frame", "Set View Orientation", crate::checked!("view.frame", view_frame))
+        .icon("camera")
+        .contract(&VIEW_FRAME_CONTRACT)
+        .output(output_schema_for::<ViewFrameResult>)
+        .params(
+        "set?: front|top (the principal axis nearest `camera`'s view becomes that face; the other keeps its place when it can), \
+         camera: {target, yaw, pitch, distance, fov?, roll?, up?, frame?} (the view, as ui.camera and the view commands give it); or reset?: true (back to the up axis preference). \
+         The design's standard views, Home and the orbit follow its FRONT and TOP; geometry doesn't move. Saved with the design, an undo step; \
+         the viewport turns to the face that was set → front, top (world axes) or null",
     ),
     CommandSpec::new("browser.order", "Order Browser Items", crate::checked!("browser.order", order))
         .icon("reorder")
@@ -153,7 +178,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          or folder?: bodies|sketches|construction|origin|joints|all (all of it; showing also shows its browser folders and groups, and `all` takes in the occurrence hides too); \
          or tree_folders?: [browser folder or group key: c0/bodies, o:4/sketches, o:4/origin, c0/g7, c0/joints, c0/canvases, c0/point_clouds] (the folder or group itself: its items keep their own state; component origin items use o:4/origin/XY etc. in items); \
          or paths?: [[occurrence ids]] (exact placements and descendants), isolate?: bool (with paths or items of bodies, and visible:true: everything else is hidden, other placements as placements); \
-         or unisolate?: bool (with visible:true and no target: put back what the isolates since the last unisolate hid, or show everything). Saved with the design and undone like any other change (the camera is not)",
+         or unisolate?: bool (with visible:true and no target: put back what the isolates since the last unisolate hid, or with none in effect show every body and placement, as folder:bodies does; sketches, construction items and joints stay as they are). Saved with the design and undone like any other change (the camera is not)",
     ),
     CommandSpec::new("browser.isolate", "Isolate", crate::checked!("browser.isolate", isolate_selection))
         .icon("body")
@@ -704,7 +729,8 @@ fn folders_holding(s: &Session, world: &[String]) -> std::collections::BTreeSet<
 }
 
 /// Unisolate: puts back what the Isolates since the last Unisolate hid, and leaves alone what was
-/// changed since (locks, sketches, dimensions). With no Isolate in effect, shows everything.
+/// changed since (locks, sketches, dimensions). With no Isolate in effect, shows every body and
+/// placement (`folder: bodies`), and nothing else (#22707).
 /// Keeps what an Isolate is about to change, with the bodies on screen now, unless an earlier
 /// Isolate is still in effect (#8120).
 fn remember_before_isolate(s: &mut Session) {
@@ -761,8 +787,10 @@ fn unisolate(s: &mut Session, p: &Value, visible: bool) -> Result<Value> {
     if ["items", "folder", "features", "joints", "paths", "tree_folders", "isolate"].iter().any(|k| p.get(*k).is_some()) {
         return Err(bad(cmd, "unisolate takes no targets"));
     }
+    // Isolate hides bodies and placements only, so with none on record that is what comes back:
+    // not every sketch, construction item and joint the user hid (#22707).
     let Some(before) = s.visibility.before_isolate.take() else {
-        return visibility(s, &json!({ "folder": "all", "visible": true }));
+        return visibility(s, &json!({ "folder": "bodies", "visible": true }));
     };
     s.visibility.hidden_bodies = before.hidden_bodies;
     s.visibility.hidden_occurrences = before.hidden_occurrences;
@@ -1385,13 +1413,37 @@ fn document_units(s: &mut Session, p: &Value) -> Result<Value> {
     reply(kept)
 }
 
+/// Whether a camera says which frame its angles are in: a `frame` that is there and not null. Null
+/// and a missing key both mean the design's current frame.
+fn has_frame(c: &Value) -> bool {
+    c.get("frame").is_some_and(|f| !f.is_null())
+}
+
+/// The current view `view.frame` reads, as the handler reads it (and `FrameCamera`, its contract
+/// type): a camera of finite numbers with a positive distance and whether it names its frame, or
+/// the message the handler refuses it with.
+pub(crate) fn frame_camera_form(c: &Value) -> std::result::Result<(solidcraft_viewport::Camera, bool), String> {
+    let cam: solidcraft_viewport::Camera = serde_json::from_value(c.clone()).map_err(|e| format!("bad camera: {e}"))?;
+    if !cam.is_valid() {
+        return Err("the camera must be finite with a positive distance".into());
+    }
+    Ok((cam, has_frame(c)))
+}
+
 /// A camera `view.save` keeps, as the handler reads it (and `ViewCamera`, its contract type): a
 /// [`solidcraft_doc::NamedView`] of finite numbers with a positive distance, or the message the
 /// handler refuses it with.
 pub(crate) fn saved_view_form(c: &Value) -> std::result::Result<solidcraft_doc::NamedView, String> {
     let v: solidcraft_doc::NamedView = serde_json::from_value(c.clone()).map_err(|e| format!("bad camera: {e}"))?;
-    let ok = [v.target.x, v.target.y, v.target.z, v.yaw, v.pitch, v.distance, v.fov, v.roll].iter().all(|x| x.is_finite()) && v.distance > 0.0;
-    if ok { Ok(v) } else { Err("the camera must be finite with a positive distance".into()) }
+    let values = [v.target.x, v.target.y, v.target.z, v.yaw, v.pitch, v.distance, v.fov, v.roll];
+    if !(values.iter().all(|x| x.is_finite()) && v.distance > 0.0) {
+        return Err("the camera must be finite with a positive distance".into());
+    }
+    // Within what a design file may hold, or the design would save and not open again.
+    if values.iter().any(|x| x.abs() > solidcraft_doc::format::MAX_REAL) {
+        return Err("the camera's values must be within ±1e9".into());
+    }
+    Ok(v)
 }
 
 /// The camera `view.apply` turns to for a `camera` it is given, as the handler reads it (and
@@ -1426,6 +1478,9 @@ fn view_save(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "view.save";
     let c = p.get("camera").ok_or_else(|| bad(cmd, "`camera` is required"))?;
     let mut v = saved_view_form(c).map_err(|e| bad(cmd, e))?;
+    if !has_frame(c) {
+        v.frame = s.doc.view_frame;
+    }
     let n = s.doc.named_views.len();
     v.name = match str_(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
         Some(n) if n.chars().count() <= 128 => n.to_string(),
@@ -1440,6 +1495,35 @@ fn view_save(s: &mut Session, p: &Value) -> Result<Value> {
     d.named_views.retain(|x| x.name != name);
     d.named_views.push(v);
     reply(cmd, ViewSaved { view: name, param_warnings: Vec::new() })
+}
+
+fn view_set_home(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "view.set_home";
+    let c = p.get("camera").ok_or_else(|| bad(cmd, "`camera` is required"))?;
+    let mut v = saved_view_form(c).map_err(|e| bad(cmd, e))?;
+    if !has_frame(c) {
+        v.frame = s.doc.view_frame;
+    }
+    // Home must be a camera `view.apply` can go to: a field of view below 0 is refused here,
+    // and the Home kept so far stays.
+    if !usable_camera(&camera_of(&v)) {
+        return Err(bad(cmd, "the camera's field of view must be 0 or more"));
+    }
+    s.doc_mut().home_view = Some(solidcraft_doc::NamedView { name: String::new(), ..v });
+    reply(cmd, ViewHome { home: s.doc.home_view.clone(), param_warnings: Vec::new() })
+}
+
+/// `view.reset_home` has something to reset only while the design keeps a Home view of its own.
+fn has_home_view(s: &Session) -> std::result::Result<(), String> {
+    match s.doc.home_view {
+        Some(_) => Ok(()),
+        None => Err("the design has no Home view of its own: Home already frames the model from the iso view".into()),
+    }
+}
+
+fn view_reset_home(s: &mut Session, _p: &Value) -> Result<Value> {
+    s.doc_mut().home_view = None;
+    reply("view.reset_home", ViewHome { home: None, param_warnings: Vec::new() })
 }
 
 /// Most a plane's drawn rectangle reaches from its origin, mm.
@@ -1477,21 +1561,82 @@ fn plane_size(s: &mut Session, p: &Value) -> Result<Value> {
     reply(cmd, PlaneSized { plane: name.to_string(), extent, param_warnings: Vec::new() })
 }
 
+fn view_frame(s: &mut Session, p: &Value) -> Result<Value> {
+    use solidcraft_viewport::{FrameFace, StandardView, ViewFrame};
+    let cmd = "view.frame";
+    // Read through the contract type, so a wrong-typed `reset` or `set` is refused with the
+    // check's message at every check level, not read as left out.
+    let params: ViewFrameParams = crate::schema::read(cmd, p)?;
+    let reset = params.reset.unwrap_or(false);
+    let (frame, view) = match (params.set, reset) {
+        (Some(_), true) => return Err(bad(cmd, "give `set` or `reset`, not both")),
+        (None, false) => return Err(bad(cmd, "`set` (front|top) or `reset: true` is required")),
+        (None, true) => (None, StandardView::Iso),
+        (Some(FrameFaceParam(face)), false) => {
+            let view = match face {
+                FrameFace::Front => StandardView::Front,
+                FrameFace::Top => StandardView::Top,
+            };
+            let c = params.camera.ok_or_else(|| bad(cmd, "`camera` (the current view) is required"))?;
+            let cam =
+                if c.framed { c.camera.in_frame(s.doc.view_frame) } else { solidcraft_viewport::Camera { frame: s.doc.view_frame, ..c.camera } };
+            let frame = ViewFrame::set_from_view(&cam, face)
+                .ok_or_else(|| bad(cmd, "the view is midway between two faces: turn it to look straight at one"))?;
+            (Some(frame), view)
+        }
+    };
+    if s.doc.view_frame != frame {
+        s.doc_mut().view_frame = frame;
+    }
+    // The viewport turns to the face that was set, or to Home after a reset.
+    let mut cam = match params.camera {
+        Some(c) => c.camera,
+        None => crate::view::home_camera(s)?,
+    };
+    cam.frame = frame;
+    cam.set_view(view);
+    if reset {
+        cam.fit(&solidcraft_render::view_bounds(&crate::view::bounds(s)?));
+    }
+    s.camera = Some(cam);
+    let axis = |v: solidcore_record::Vec3| [v.x, v.y, v.z];
+    let result = match frame {
+        Some(f) => ViewFrameResult::Set { front: axis(f.front()), top: axis(f.top()), camera: cam, param_warnings: Vec::new() },
+        None => ViewFrameResult::Reset { frame: (), camera: cam, param_warnings: Vec::new() },
+    };
+    reply(cmd, result)
+}
+
 fn view_apply(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "view.apply";
     let cam = match (str_(p, "view"), p.get("camera")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give `view` or `camera`, not both")),
         (None, None) => return Err(bad(cmd, "`view` (a name) or `camera` is required")),
-        (None, Some(c)) => applied_camera_form(c).map_err(|e| bad(cmd, e))?,
-        // Standard view names come first, as in the browser's Named Views folder.
-        (Some(name), None) => match solidcraft_viewport::StandardView::parse(name) {
-            Some(sv) => {
-                let mut c = crate::view::home_camera(s)?;
-                c.set_view(sv);
-                c.fit(&solidcraft_render::view_bounds(&crate::view::bounds(s)?));
-                c
-            }
-            None => s.doc.named_views.iter().find(|v| v.name == name).map(camera_of).ok_or_else(|| bad(cmd, format!("no named view `{name}`")))?,
+        // A camera given without a frame is read in the design's own frame; one with a frame is
+        // turned into it, keeping the view it shows.
+        (None, Some(c)) => {
+            let cam = applied_camera_form(c).map_err(|e| bad(cmd, e))?;
+            if has_frame(c) { cam.in_frame(s.doc.view_frame) } else { solidcraft_viewport::Camera { frame: s.doc.view_frame, ..cam } }
+        }
+        (Some(name), None) => match crate::view::home_view(s).filter(|_| name.eq_ignore_ascii_case("home")) {
+            // The design's own Home view, when it keeps one (#19972).
+            Some(home) => home,
+            // Standard view names come first, as in the browser's Named Views folder.
+            None => match solidcraft_viewport::StandardView::parse(name) {
+                Some(sv) => {
+                    let mut c = crate::view::home_camera(s)?;
+                    c.set_view(sv);
+                    c.fit(&solidcraft_render::view_bounds(&crate::view::bounds(s)?));
+                    c
+                }
+                None => s
+                    .doc
+                    .named_views
+                    .iter()
+                    .find(|v| v.name == name)
+                    .map(|v| camera_of(v).in_frame(s.doc.view_frame))
+                    .ok_or_else(|| bad(cmd, format!("no named view `{name}`")))?,
+            },
         },
     };
     if !usable_camera(&cam) {
@@ -1502,8 +1647,17 @@ fn view_apply(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The full orbit camera of a named view, including its saved roll and up direction.
-fn camera_of(v: &solidcraft_doc::NamedView) -> solidcraft_viewport::Camera {
-    solidcraft_viewport::Camera { target: v.target, yaw: v.yaw, pitch: v.pitch, distance: v.distance, fov: v.fov, roll: v.roll, up: v.up }
+pub(crate) fn camera_of(v: &solidcraft_doc::NamedView) -> solidcraft_viewport::Camera {
+    solidcraft_viewport::Camera {
+        target: v.target,
+        yaw: v.yaw,
+        pitch: v.pitch,
+        distance: v.distance,
+        fov: v.fov,
+        roll: v.roll,
+        up: v.up,
+        frame: v.frame,
+    }
 }
 
 fn view_index(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
@@ -1540,7 +1694,7 @@ fn view_list(s: &mut Session, _p: &Value) -> Result<Value> {
 
 /// The keys whose strings name bodies, alone or in a list (`body`, `targets`…), at any depth of a
 /// feature: its own fields and the face, edge and link references inside it.
-const BODY_KEYS: [&str; 6] = ["body", "bodies", "target", "target_bodies", "targets", "tools"];
+const BODY_KEYS: [&str; 7] = ["body", "bodies", "member", "target", "target_bodies", "targets", "tools"];
 
 /// Replace the body name `old` with `new` where a string names a body (the value of one of
 /// [`BODY_KEYS`]); other strings equal to it (sketch text, plane and feature names, expressions)
@@ -2163,6 +2317,7 @@ fn redefine_in_place(s: &mut Session, id: u64, p: &Value, cmd: &str) -> Result<R
     trial.refresh();
     s.doc = trial.doc;
     s.pending_moves = trial.pending_moves;
+    s.pending_move_records = trial.pending_move_records;
 
     let attachment = s.doc.feature(id).and_then(|feature| match &feature.kind {
         FeatureKind::Sketch { plane, .. } => {
@@ -2522,9 +2677,18 @@ mod tests {
         assert_eq!(hidden(&s).len(), 2, "undo brings the isolation back");
         assert!(s.visibility.before_isolate.is_some(), "and Unisolate with it");
         run(&mut s, "edit.redo", json!({}));
-        // With no Isolate in effect, Unisolate shows everything.
+        // With no Isolate in effect, Unisolate shows every body, and nothing else (#22707).
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Spare"}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "browser.visibility", json!({"folder": "sketches", "visible": false}));
+        run(&mut s, "browser.visibility", json!({"folder": "origin", "visible": false}));
+        let (sketches, origin) = (s.visibility.hidden_sketches.clone(), s.visibility.hidden_origin.clone());
+        assert!(!sketches.is_empty() && !origin.is_empty());
         run(&mut s, "browser.visibility", json!({"visible": true, "unisolate": true}));
         assert!(hidden(&s).is_empty());
+        assert_eq!(s.visibility.hidden_sketches, sketches, "the hidden sketches stay hidden");
+        assert!(s.visibility.shown_sketches.is_empty(), "and none is marked shown");
+        assert_eq!(s.visibility.hidden_origin, origin, "the origin too");
         assert!(s.execute("browser.visibility", &json!({"visible": false, "unisolate": true})).is_err());
         assert!(s.execute("browser.visibility", &json!({"visible": true, "unisolate": true, "items": ["A"]})).is_err());
     }
@@ -2666,6 +2830,61 @@ mod tests {
         assert!(!s.body_visible("Peg"));
         run(&mut s, "edit.redo", json!({}));
         assert!(!s.body_visible("Stud"));
+    }
+
+    #[test]
+    fn computed_hides_are_kept_through_a_rename_and_in_every_undo_step() {
+        // #22153: what a computation hid stays hidden beside what was hidden meanwhile, also
+        // when it renamed a body, and undoing any of its steps keeps the hide made meanwhile.
+        let boxes = |s: &mut Session| {
+            for name in ["Peg", "Master", "Door", "Cabinet"] {
+                run(s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": name}));
+            }
+        };
+        let mut s = Session::default();
+        boxes(&mut s);
+        run(&mut s, "browser.visibility", json!({"items": ["Peg"], "visible": false}));
+        let mut computed = s.scratch();
+        run(&mut computed, "body.rename", json!({"body": "Peg", "name": "Stud"}));
+        run(&mut computed, "browser.visibility", json!({"items": ["Master"], "visible": false}));
+        run(&mut s, "browser.visibility", json!({"items": ["Cabinet"], "visible": false}));
+        s.accept_computed(computed).unwrap();
+        let shown = |s: &Session, names: &[&str]| names.iter().map(|name| s.body_visible(name)).collect::<Vec<_>>();
+        assert_eq!(shown(&s, &["Stud", "Master", "Door", "Cabinet"]), [false, false, true, false], "rename, run hide and hide meanwhile");
+
+        let mut s = Session::default();
+        boxes(&mut s);
+        let mut computed = s.scratch();
+        run(&mut computed, "browser.visibility", json!({"items": ["Master"], "visible": false}));
+        run(&mut computed, "browser.visibility", json!({"items": ["Door"], "visible": false}));
+        run(&mut s, "browser.visibility", json!({"items": ["Cabinet"], "visible": false}));
+        s.accept_computed(computed).unwrap();
+        let all = ["Master", "Door", "Cabinet"];
+        assert_eq!(shown(&s, &all), [false, false, false]);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(shown(&s, &all), [false, true, false], "undoing the second step keeps the first and the hide meanwhile");
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(shown(&s, &all), [true, true, false], "undoing the first step keeps the hide meanwhile");
+        run(&mut s, "edit.redo", json!({}));
+        run(&mut s, "edit.redo", json!({}));
+        assert_eq!(shown(&s, &all), [false, false, false]);
+    }
+
+    #[test]
+    fn computed_visibility_merges_large_hidden_sets_by_membership() {
+        // Ten thousand hidden bodies, a few changed: the result is the live list with them.
+        let start: Vec<String> = (0..10_000).map(|i| format!("B{i}")).collect();
+        let mut ran = start.clone();
+        ran.retain(|b| b != "B5");
+        ran.push("New".into());
+        let mut live = start.clone();
+        live.push("Meanwhile".into());
+        crate::merge_hidden(&mut live, &start, &ran);
+        assert_eq!(live.len(), 10_001);
+        assert!(!live.contains(&"B5".to_string()) && live.contains(&"New".to_string()) && live.contains(&"Meanwhile".to_string()));
+        let mut unchanged = live.clone();
+        crate::merge_hidden(&mut unchanged, &ran, &ran);
+        assert_eq!(unchanged, live, "a computation that hid and showed nothing leaves the list as it is");
     }
 
     #[test]
@@ -3617,9 +3836,17 @@ mod tests {
         assert_eq!(back.named_views[0].target.z, 3.0);
         run(&mut s, "view.delete", json!({"view": "Detail"}));
         assert_eq!(run(&mut s, "view.list", json!({}))["views"].as_array().unwrap().len(), 1);
-        for p in [json!({}), json!({"camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": -1}}), json!({"camera": "x"})] {
+        for p in [
+            json!({}),
+            json!({"camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": -1}}),
+            json!({"camera": "x"}),
+            // Beyond what a design file holds: the design would save and not open again.
+            json!({"camera": {"target": [1e12, 0, 0], "yaw": 0, "pitch": 0, "distance": 100}}),
+            json!({"camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 1e15}}),
+        ] {
             assert!(s.execute("view.save", &p).is_err(), "{p}");
         }
+        solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
         run(&mut s, "edit.undo", json!({}));
         assert_eq!(s.doc.named_views.len(), 2);
     }
@@ -3651,6 +3878,50 @@ mod tests {
             let invalid = json!({"camera":{"target":[0,0,0],"yaw":0,"pitch":0,"distance":100,"roll":roll}});
             assert!(s.execute("view.save", &invalid).is_err());
         }
+    }
+
+    /// The design keeps its own Home view (#19972): set from a camera, saved with the design,
+    /// taken by `view.apply` home, undone in one step and reset to the iso view framing the model.
+    #[test]
+    fn the_home_view_is_set_saved_applied_and_reset() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 20, "height": 30}));
+        let framed = run(&mut s, "view.apply", json!({"view": "home"}))["camera"].clone();
+        assert!(crate::view::home_view(&s).is_none());
+        assert!(crate::find_command("view.reset_home").unwrap().allowed(&s).is_err(), "nothing to reset yet");
+        let why = s.execute("view.reset_home", &json!({})).unwrap_err().to_string();
+        assert!(why.contains("no Home view of its own"), "{why}");
+
+        let camera = json!({"target": [1, 2, 3], "yaw": 0.25, "pitch": -0.3, "distance": 150, "fov": 0.1, "roll": 0.6, "up": "y"});
+        let set = run(&mut s, "view.set_home", json!({"camera": camera}));
+        assert_eq!(set["home"]["yaw"], 0.25);
+        let applied = run(&mut s, "view.apply", json!({"view": "Home"}))["camera"].clone();
+        assert_eq!(
+            (&applied["yaw"], &applied["pitch"], &applied["distance"], &applied["roll"]),
+            (&json!(0.25), &json!(-0.3), &json!(150.0), &json!(0.6))
+        );
+        // The standard views still frame the model, and the named views are untouched.
+        assert_ne!(run(&mut s, "view.apply", json!({"view": "iso"}))["camera"], applied);
+        assert!(s.doc.named_views.is_empty());
+
+        let reopened = serde_json::from_str::<solidcraft_doc::Document>(&serde_json::to_string(&*s.doc).unwrap()).unwrap();
+        let mut restored = Session::new(reopened);
+        assert_eq!(run(&mut restored, "view.apply", json!({"view": "home"}))["camera"], applied);
+
+        for p in [json!({}), json!({"camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": -1}}), json!({"camera": "x"})] {
+            assert!(s.execute("view.set_home", &p).is_err(), "{p}");
+        }
+        let kept = s.doc.home_view.clone();
+        let unusable = json!({"camera": {"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 100, "fov": -1}});
+        assert!(s.execute("view.set_home", &unusable).is_err(), "a field of view below 0 is refused");
+        assert_eq!(s.doc.home_view, kept, "and the Home kept so far stays");
+        run(&mut s, "view.reset_home", json!({}));
+        assert!(s.doc.home_view.is_none());
+        assert_eq!(run(&mut s, "view.apply", json!({"view": "home"}))["camera"], framed);
+        run(&mut s, "edit.undo", json!({}));
+        assert!(crate::view::home_view(&s).is_some(), "reset is one undo step");
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.doc.home_view.is_none(), "set is one undo step");
     }
 
     #[test]
@@ -4570,5 +4841,172 @@ mod tests {
         let too_long = "中".repeat(257);
         let error = s.execute("browser.order", &json!({"folder": "bodies", "order": [too_long]})).unwrap_err().to_string();
         assert!(error.contains("bad keys"), "{error}");
+    }
+
+    /// #6455: the axes navigator's Set as Front / Top gives the design its own FRONT and TOP. The
+    /// viewport turns to that face, the standard views follow, it is an undo step and it is saved.
+    #[test]
+    fn set_as_front_and_top_give_the_design_its_own_orientation() {
+        use solidcraft_viewport::vec::Vec3Ops;
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        // Looking from the right (+X), a little from above: that face becomes FRONT.
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Right);
+        cam.pitch = 0.2;
+        let r = run(&mut s, "view.frame", json!({"set": "front", "camera": cam}));
+        assert_eq!((r["front"].clone(), r["top"].clone()), (json!([1.0, 0.0, 0.0]), json!([0.0, 0.0, 1.0])));
+        let f = s.doc.view_frame.expect("the design has its own frame");
+        let viewed = s.camera.expect("the viewport turns to the new front");
+        assert!(viewed.back().dist(f.front()) < 1e-9);
+        // The standard views follow it.
+        run(&mut s, "view.apply", json!({"view": "front"}));
+        assert!(s.camera.unwrap().back().dist(solidcore_record::Vec3::X) < 1e-9);
+        // Saved with the design.
+        let text = s.doc.to_json();
+        assert_eq!(solidcraft_doc::format::read(&text).unwrap().view_frame, Some(f));
+        // Set as Top from the front view: the displaced FRONT goes to the face nearest the screen's up.
+        // (Its own design, with no frame yet: a camera is read in the design's frame.)
+        let mut fresh = Session::default();
+        run(&mut fresh, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut front_view = Camera::default();
+        front_view.set_view(StandardView::Front);
+        let r = run(&mut fresh, "view.frame", json!({"set": "top", "camera": front_view}));
+        assert_eq!((r["top"].clone(), r["front"].clone()), (json!([0.0, -1.0, 0.0]), json!([0.0, 0.0, 1.0])));
+        // Set as Top from the top view of the new frame keeps FRONT.
+        let mut top = Camera { frame: Some(f), ..Camera::default() };
+        top.set_view(StandardView::Top);
+        run(&mut s, "view.frame", json!({"set": "top", "camera": top}));
+        assert_eq!(s.doc.view_frame, Some(f));
+        // An undo step; Reset goes back to the preference's.
+        run(&mut s, "view.frame", json!({"reset": true}));
+        assert_eq!(s.doc.view_frame, None);
+        run(&mut s, "edit.undo", json!({}));
+        assert_eq!(s.doc.view_frame, Some(f));
+        for bad in [json!({}), json!({"set": "left", "camera": cam}), json!({"set": "front"}), json!({"set": "top", "camera": cam, "reset": true})] {
+            assert!(s.execute("view.frame", &bad).is_err(), "{bad}");
+        }
+    }
+
+    /// A saved frame that is not two exact principal axes at right angles reads as no frame.
+    #[test]
+    fn a_bad_saved_frame_reads_as_none() {
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Right);
+        run(&mut s, "view.frame", json!({"set": "front", "camera": cam}));
+        let text = s.doc.to_json();
+        assert!(solidcraft_doc::format::read(&text).unwrap().view_frame.is_some());
+        let mut saved: Value = serde_json::from_str(&text).unwrap();
+        for bad in [
+            json!({"front": [1.0, 0.0, 0.0], "top": [1.0, 0.0, 0.0]}),
+            json!({"front": [0.9, 0.1, 0.0], "top": [0.0, 0.0, 1.0]}),
+            json!("front"),
+            json!({"front": [1.0, 0.0, 0.0]}),
+            json!({"top": [0.0, 0.0, 1.0], "front": 3}),
+        ] {
+            saved["view_frame"] = bad.clone();
+            let read = solidcraft_doc::format::read(&saved.to_string()).unwrap();
+            assert_eq!(read.view_frame, None, "{bad}");
+        }
+    }
+
+    /// A view applied in a design with its own frame keeps that frame, so the navigator does not
+    /// turn the design back to the up axis preference.
+    #[test]
+    fn applying_a_view_keeps_the_design_frame() {
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Right);
+        run(&mut s, "view.frame", json!({"set": "front", "camera": cam}));
+        let frame = s.doc.view_frame.expect("the design has its own frame");
+        run(&mut s, "view.apply", json!({"camera": {"target": [0, 0, 0], "yaw": 1, "pitch": 0.2, "distance": 80, "fov": 0.5}}));
+        assert_eq!(s.camera.expect("the view is applied").frame, Some(frame));
+        run(&mut s, "view.apply", json!({"view": "front"}));
+        assert_eq!(s.camera.expect("the standard view is applied").frame, Some(frame));
+    }
+
+    /// Midway between two faces (the Home view is one) Set as is refused, saying why.
+    #[test]
+    fn set_as_refuses_a_view_midway_between_two_faces() {
+        use solidcraft_viewport::Camera;
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let err = s.execute("view.frame", &json!({"set": "top", "camera": Camera::default()})).unwrap_err().to_string();
+        assert!(err.contains("midway"), "{err}");
+        assert_eq!(s.doc.view_frame, None);
+    }
+
+    /// A camera given without a frame is read in the design's own frame, so Set as Top from its top
+    /// view keeps the design's FRONT.
+    #[test]
+    fn view_frame_reads_a_camera_in_the_design_frame() {
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Right);
+        cam.pitch = 0.2;
+        run(&mut s, "view.frame", json!({"set": "front", "camera": cam}));
+        let f = s.doc.view_frame.expect("the design has its own frame");
+        let mut top = Camera::default();
+        top.set_view(StandardView::Top);
+        let r = run(&mut s, "view.frame", json!({"set": "top", "camera": top}));
+        assert_eq!(
+            (r["front"].clone(), r["top"].clone()),
+            (json!([f.front().x, f.front().y, f.front().z]), json!([f.top().x, f.top().y, f.top().z]))
+        );
+        assert_eq!(s.doc.view_frame, Some(f));
+    }
+
+    /// A named view keeps the look it was saved with: applied after Set as Front from another view,
+    /// and after a `view.frame` reset, it still looks where it did.
+    #[test]
+    fn a_named_view_keeps_its_look_under_a_frame() {
+        use solidcraft_viewport::vec::Vec3Ops;
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut look = Camera::default();
+        look.set_view(StandardView::Right);
+        run(&mut s, "view.save", json!({"name": "Looking east", "camera": look}));
+        let mut from_right = Camera::default();
+        from_right.set_view(StandardView::Right);
+        from_right.pitch = 0.2;
+        run(&mut s, "view.frame", json!({"set": "front", "camera": from_right}));
+        run(&mut s, "view.apply", json!({"view": "Looking east"}));
+        let east = solidcore_record::Vec3::X;
+        assert!(s.camera.expect("the view is applied").back().dist(east) < 1e-9);
+        run(&mut s, "view.frame", json!({"reset": true}));
+        run(&mut s, "view.apply", json!({"view": "Looking east"}));
+        assert!(s.camera.expect("the view is applied").back().dist(east) < 1e-9);
+    }
+
+    /// `"frame": null` means the design's current frame, as a missing key does (view.apply).
+    #[test]
+    fn a_null_frame_applies_as_the_design_frame() {
+        use solidcraft_viewport::{Camera, StandardView};
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 5}));
+        let mut cam = Camera::default();
+        cam.set_view(StandardView::Right);
+        cam.pitch = 0.2;
+        run(&mut s, "view.frame", json!({"set": "front", "camera": cam}));
+        let f = s.doc.view_frame.expect("the design has its own frame");
+        let angles = json!({"target": [0, 0, 0], "yaw": 1, "pitch": 0.2, "distance": 80, "fov": 0.5});
+        let mut with_null = angles.clone();
+        with_null["frame"] = Value::Null;
+        run(&mut s, "view.apply", json!({"camera": with_null}));
+        let null_view = s.camera.expect("the view is applied");
+        run(&mut s, "view.apply", json!({"camera": angles}));
+        let missing_view = s.camera.expect("the view is applied");
+        assert_eq!(null_view, missing_view);
+        assert_eq!(null_view.frame, Some(f));
+        assert_eq!(null_view.yaw, 1.0);
     }
 }

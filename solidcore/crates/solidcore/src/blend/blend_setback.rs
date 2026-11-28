@@ -117,6 +117,7 @@ use crate::geom::extent2d::Extent2d;
 use crate::geom::vector2d::{Point2, Vec2};
 use crate::geom::vector3d::sqrt;
 use crate::kernel::Kernel;
+use crate::math::det;
 use crate::math::{Point3, Vec3, EFF_ZERO, PI};
 use crate::nurbs::b_spline_curve::KnotType;
 use crate::nurbs::b_spline_surface::{
@@ -139,7 +140,7 @@ pub use curved::{no_more_concave, round_end_curvature};
 pub(crate) use face_plane::{FacePlane, Hom2};
 pub use spring::{spring_curve, SpringCurve, SpringHalf};
 
-pub(crate) use scale::bisect_thousandths;
+pub(crate) use scale::{bisect_thousandths, model_rounds, unequal_radii};
 pub use scale::{certified_scale, CertifiedScale};
 
 const OP: &str = "blend::blend_setback";
@@ -1053,7 +1054,7 @@ pub fn distances(faces: &[Face], edges: &[Edge]) -> core::result::Result<Setback
                 el_ref(faces, f0)?.normal.dot(el_ref(faces, f1)?.normal),
             ),
         );
-        *el_mut(&mut rail, i)? = e.radius * (0.5 * cos.acos()).tan();
+        *el_mut(&mut rail, i)? = e.radius * det::tan(0.5 * det::acos(cos));
     }
     let mut least = vec![0.0; le];
     for f in 0..lf {
@@ -1615,6 +1616,56 @@ fn round_jets(
     Ok(RoundJets { h, q: lq })
 }
 
+/// Whether the built round runs across its end opposite to the model.
+/// Returns no orientation if the boundary jets do not agree to working roundoff.
+pub(crate) fn model_end_reversal(
+    kernel: &Kernel,
+    model: &Round<'_>,
+    actual: &Round<'_>,
+    origin: Point3,
+) -> core::result::Result<Option<bool>, Refusal> {
+    let model_jets = round_jets(kernel, model, 1)?;
+    let actual_jets = round_jets(kernel, actual, 1)?;
+    if model_jets.q != actual_jets.q {
+        return Ok(None);
+    }
+    let at_origin = |h: &Hom| {
+        [
+            h[0] - origin.x * h[3],
+            h[1] - origin.y * h[3],
+            h[2] - origin.z * h[3],
+            h[3],
+        ]
+    };
+    let same = |a: &Hom, b: &Hom, direction: f64| {
+        at_origin(a).into_iter().zip(at_origin(b)).all(|(x, y)| {
+            x.is_finite()
+                && y.is_finite()
+                && (x - direction * y).abs() <= EFF_ZERO * (1.0 + x.abs().max(y.abs()))
+        })
+    };
+    let direction = if model.corner_above == actual.corner_above {
+        1.0
+    } else {
+        -1.0
+    };
+    Ok([false, true].into_iter().find(|&reverse| {
+        model_jets
+            .h
+            .iter()
+            .zip(&actual_jets.h)
+            .enumerate()
+            .all(|(order, (m, a))| {
+                m.iter().enumerate().all(|(i, point)| {
+                    let j = if reverse { model_jets.q - i } else { i };
+                    a.get(j).is_some_and(|other| {
+                        same(point, other, if order == 0 { 1.0 } else { direction })
+                    })
+                })
+            })
+    }))
+}
+
 /// A round's raw jets at its end (`h[d][j]`: column j's d-th homogeneous derivative along,
 /// `d = 0 ..= k`, `k <= 2`) put in the section's standard form across at every rail parameter,
 /// to order k: column j times `c^j`, `c = (W_0 / W_q)^(1 / q)` the ratio of the row's end
@@ -1666,7 +1717,7 @@ fn standard_form_across(
     let l2 = ((w0[2] * w0[0] - w0[1] * w0[1]) / (w0[0] * w0[0])
         - (wq[2] * wq[0] - wq[1] * wq[1]) / (wq[0] * wq[0]))
         / qf;
-    let c = (w0[0] / wq[0]).powf(1.0 / qf);
+    let c = det::powf(w0[0] / wq[0], 1.0 / qf);
     let (c1, c2) = (c * l1, c * (l2 + l1 * l1));
     // c^j, c^(j - 1), c^(j - 2) (the last two only where j reaches them: their factors are 0
     // below)
@@ -1700,7 +1751,7 @@ fn row_middle(row: &[Hom]) -> Result<Hom> {
     let q = row.len().checked_sub(1).ok_or_else(past_table)?;
     let mut m = HOM_ZERO;
     for (j, h) in row.iter().enumerate() {
-        m = axpy(&m, binomial(q, j)? / 2.0_f64.powf(q as f64), h);
+        m = axpy(&m, binomial(q, j)? / det::powf(2.0_f64, q as f64), h);
     }
     Ok(m)
 }
@@ -2558,8 +2609,8 @@ fn fill_hole_with(
     let bs: Vec<Point2> = (0..n)
         .map(|m| {
             Point2::new(
-                (2.0 * PI * m as f64 / nf).cos(),
-                (2.0 * PI * m as f64 / nf).sin(),
+                det::cos(2.0 * PI * m as f64 / nf),
+                det::sin(2.0 * PI * m as f64 / nf),
             )
         })
         .collect();
@@ -2688,7 +2739,7 @@ fn fill_hole_with(
         let q = h0.len() - 1;
         let mut mh = HOM_ZERO;
         for (c, hc) in h0.iter().enumerate() {
-            mh = axpy(&mh, binomial(q, c)? / 2.0_f64.powf(q as f64), hc);
+            mh = axpy(&mh, binomial(q, c)? / det::powf(2.0_f64, q as f64), hc);
         }
         let mid = Point3::new(mh[0] / mh[3], mh[1] / mh[3], mh[2] / mh[3]);
         let side = if (mid - face.point).dot(face.normal) < 0.0 {
@@ -3393,7 +3444,9 @@ mod tests {
         coef.iter()
             .enumerate()
             .map(|(i, c)| {
-                c * binomial(n, i).unwrap() * s.powi(i as i32) * (1.0 - s).powi((n - i) as i32)
+                c * binomial(n, i).unwrap()
+                    * det::powi(s, i as i32)
+                    * det::powi(1.0 - s, (n - i) as i32)
             })
             .sum()
     }

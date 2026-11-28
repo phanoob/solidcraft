@@ -196,6 +196,7 @@ fn orbit(app: &mut SolveApp, ui: &mut egui::Ui) {
         });
         ui.add_enabled_ui(app.preferences.space_mouse_enabled, |ui| {
             setting::space_mouse_sketch_orbit(app, ui).backing_on_hover_text(solidcraft_ui_text::tr("ui.3d_mouse_sketch_orbit_tip"));
+            setting::space_mouse_horizon_lock(app, ui).backing_on_hover_text(solidcraft_ui_text::tr("ui.3d_mouse_horizon_lock_tip"));
         });
     });
 }
@@ -262,60 +263,106 @@ fn axes(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
         let calibration = app.space_mouse.device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get(device));
         let meters: [_; 6] = std::array::from_fn(|axis| axis_meter(calibration, raw, app.preferences.space_mouse_axis_source, axis));
-        let columns = ui_kit::AxisColumns {
-            axis: solidcraft_ui_text::tr("prefs.axis"),
-            live_input: solidcraft_ui_text::tr("prefs.live_input"),
-            speed: solidcraft_ui_text::tr("prefs.speed"),
-            source: solidcraft_ui_text::tr("prefs.source"),
-        };
-        ui_kit::settings_axis_header(ui, &columns);
-        for (axis, (name, off)) in rows.iter().enumerate() {
-            ui.push_id(("space_mouse_axis", axis), |ui| {
-                let (value, zone) = meters[axis];
-                let prefs = &mut app.preferences;
-                let (reverse, speed, source) =
-                    (prefs.space_mouse_reverse.get_mut(axis), prefs.space_mouse_axis_speed.get_mut(axis), &mut prefs.space_mouse_axis_source);
-                ui_kit::settings_axis_row(
-                    ui,
-                    &columns,
-                    name,
-                    value,
-                    zone,
-                    // Invert and speed do nothing on a row the driver turns off. The motion choice
-                    // stays live, so a motion can still be swapped out of it.
-                    |ui| {
-                        ui.add_enabled_ui(enabled && !off, |ui| {
-                            if let Some(reverse) = reverse {
-                                ui_kit::checkbox(ui, solidcraft_ui_text::tr_label("Invert"), reverse);
-                            }
-                        });
-                    },
-                    |ui| {
-                        ui.add_enabled_ui(enabled && !off, |ui| {
-                            if let Some(speed) = speed {
-                                ui_kit::settings_axis_gain(ui, speed);
-                            }
-                        });
-                    },
-                    |ui| {
-                        ui.add_enabled_ui(enabled, |ui| {
-                            let current = source.get(axis).copied().unwrap_or(axis);
-                            let mut chosen = current;
-                            ui_kit::dropdown_menu(ui, ("sc_space_mouse_source", axis), motions.get(current).map_or("", String::as_str), |ui| {
-                                for (from, name) in motions.iter().enumerate() {
-                                    if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
-                                        chosen = from;
-                                    }
-                                }
-                            })
-                            .backing_on_hover_text(if *off { &off_tip } else { &driven_by });
-                            if chosen != current {
-                                crate::space_mouse::reassign(source, axis, chosen);
-                            }
-                        });
-                    },
-                );
-            });
+        let t = Tokens::get();
+        let columns = [
+            ui_kit::Column::new(solidcraft_ui_text::tr("prefs.axis"), 1.5).flex(),
+            ui_kit::Column::new(solidcraft_ui_text::tr("prefs.live_input"), 1.0).flex(),
+            ui_kit::Column::new(solidcraft_ui_text::tr_label("Invert"), 0.5).flex(),
+            ui_kit::Column::new(solidcraft_ui_text::tr("prefs.speed"), 0.0).min_content_width(t.space_24 * 2.0 + t.space_16),
+            ui_kit::Column::new(solidcraft_ui_text::tr("prefs.source"), 2.0).flex(),
+        ];
+        let mut shown = Vec::new();
+        ui_kit::table_fitted(ui, "space_mouse_axes", &columns, "", |ui, table| {
+            if !ui_kit::settings_search::suppress_chrome(ui) {
+                table.headers(ui, |_, _| false);
+            }
+            for (axis, (name, off)) in rows.iter().enumerate() {
+                ui.push_id(("space_mouse_axis", axis), |ui| {
+                    let (value, zone) = meters[axis];
+                    let prefs = &mut app.preferences;
+                    let (reverse, speed, source) =
+                        (prefs.space_mouse_reverse.get_mut(axis), prefs.space_mouse_axis_speed.get_mut(axis), &mut prefs.space_mouse_axis_source);
+                    ui_kit::settings_search::set_control(ui, name);
+                    let show = ui_kit::settings_search::visible(ui, &[name]);
+                    let draw = |ui: &mut egui::Ui| {
+                        table.row(ui, &axis.to_string(), false, |row| {
+                            row.cell(|ui| ui_kit::text(ui, name, ui_kit::Text::Cell));
+                            row.cell(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), t.space_14), egui::Sense::hover());
+                                ui_kit::live_axis_bar_in(ui, rect, value, zone);
+                            });
+                            // Invert and speed do nothing on a row the driver turns off. The motion choice
+                            // stays live, so a motion can still be swapped out of it.
+                            row.cell(|ui| {
+                                ui_kit::named_control(ui, name, |ui| {
+                                    ui.add_enabled_ui(enabled && !off, |ui| {
+                                        if let Some(reverse) = reverse {
+                                            let response =
+                                                ui_kit::checkbox(ui, "", reverse).backing_on_hover_text(solidcraft_ui_text::tr_label("Invert"));
+                                            response.widget_info(|| {
+                                                egui::WidgetInfo::selected(
+                                                    egui::Role::CheckBox,
+                                                    ui.is_enabled(),
+                                                    *reverse,
+                                                    solidcraft_ui_text::tr_label("Invert"),
+                                                )
+                                            });
+                                        }
+                                    });
+                                })
+                            });
+                            row.cell(|ui| {
+                                ui_kit::named_control(ui, name, |ui| {
+                                    ui.add_enabled_ui(enabled && !off, |ui| {
+                                        if let Some(speed) = speed {
+                                            ui_kit::settings_axis_gain(ui, speed);
+                                        }
+                                    });
+                                })
+                            });
+                            row.cell(|ui| {
+                                ui_kit::named_control(ui, name, |ui| {
+                                    ui.add_enabled_ui(enabled, |ui| {
+                                        let current = source.get(axis).copied().unwrap_or(axis);
+                                        let mut chosen = current;
+                                        ui_kit::dropdown_menu(
+                                            ui,
+                                            ("sc_space_mouse_source", axis),
+                                            motions.get(current).map_or("", String::as_str),
+                                            |ui| {
+                                                for (from, name) in motions.iter().enumerate() {
+                                                    if ui_kit::list_picker(ui, name, name, chosen == from).clicked() {
+                                                        chosen = from;
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .backing_on_hover_text(if *off { &off_tip } else { &driven_by });
+                                        if chosen != current {
+                                            crate::space_mouse::reassign(source, axis, chosen);
+                                        }
+                                    });
+                                })
+                            });
+                        })
+                    };
+                    if show {
+                        ui_kit::settings_search::push_passthrough(ui);
+                        let response = draw(ui);
+                        ui_kit::settings_search::pop_passthrough(ui);
+                        shown.push((name.clone(), response.rect));
+                    } else {
+                        ui_kit::settings_search::run_hidden(ui, name, draw);
+                        ui_kit::settings_search::recheck(ui, &[name]);
+                    }
+                });
+            }
+        });
+        for (name, rect) in shown {
+            ui_kit::settings_search::remember(ui, &name, rect);
+            ui_kit::settings_search::follow(ui, &name, rect);
+            crate::scenario::publish_rect(&format!("prefs:axis:{name}"), rect);
+            crate::scenario::publish_target(&format!("dialog:row:{name}"), rect);
         }
         ui_kit::row(ui, "", |ui| {
             let reassigned = app.preferences.space_mouse_axis_source != crate::space_mouse::SAME_AXES;
@@ -333,22 +380,36 @@ fn axes(app: &mut SolveApp, ui: &mut egui::Ui) {
 fn advanced(app: &mut SolveApp, ui: &mut egui::Ui) {
     ui_kit::settings_section(ui, "space_mouse_advanced", app.tr("Advanced"), |ui| {
         ui_kit::settings_form(ui, FORM_LABEL_WIDTH, |ui| {
-            // Only where the reader has seen the choice: Linux, with spacenavd and the device both there.
-            if let Some(present) = app.space_mouse.drivers.filter(|present| present.spacenavd || (present.direct && !present.denied)) {
+            // Only where the reader has seen the choice: Linux, with two of smed, spacenavd and the device there.
+            if let Some(present) = app.space_mouse.drivers.filter(|present| present.smed || present.spacenavd || (present.direct && !present.denied))
+            {
                 let [label, auto, direct, only_spacenavd, only_direct] =
                     ["driver", "driver_auto", "driver_direct", "driver_only_spacenavd", "driver_only_direct"]
                         .map(|key| app.tr(&format!("ui.3d_mouse_{key}")).to_owned());
                 let driver = &mut app.preferences.space_mouse_driver;
-                ui_kit::row(ui, &label, |ui| match (present.spacenavd, present.direct) {
-                    (true, true) => {
+                let there = |choice| match choice {
+                    SpaceMouseDriver::Automatic => true,
+                    SpaceMouseDriver::Smed => present.smed,
+                    SpaceMouseDriver::Spacenavd => present.spacenavd,
+                    SpaceMouseDriver::Direct => present.direct,
+                };
+                let readers = usize::from(present.smed) + usize::from(present.spacenavd) + usize::from(present.direct);
+                // A choice to make: two readers or more, or smed there while the saved choice is not
+                // (Direct or spacenavd saved, smed the only reader), so it can be switched to smed, or
+                // smed saved while it does not run, so it can be switched away from smed.
+                let choice = readers >= 2 || (present.smed && !there(*driver)) || (*driver == SpaceMouseDriver::Smed && !present.smed);
+                ui_kit::row(ui, &label, |ui| match (choice, present.smed, present.spacenavd) {
+                    (true, _, _) => {
                         let name = |driver| match driver {
                             SpaceMouseDriver::Automatic => auto.as_str(),
+                            SpaceMouseDriver::Smed => "smed",
                             SpaceMouseDriver::Spacenavd => "spacenavd",
                             SpaceMouseDriver::Direct => direct.as_str(),
                         };
                         ui_kit::settings_control_width(ui, Tokens::get().space_24 * 8.0 + Tokens::get().space_8, |ui| {
                             ui_kit::dropdown_menu(ui, "sc_space_mouse_driver", name(*driver), |ui| {
-                                for choice in SpaceMouseDriver::ALL {
+                                let current = *driver;
+                                for choice in SpaceMouseDriver::ALL.into_iter().filter(|&choice| there(choice) || current == choice) {
                                     if ui_kit::list_picker(ui, name(choice), name(choice), *driver == choice).clicked() {
                                         *driver = choice;
                                     }
@@ -356,10 +417,13 @@ fn advanced(app: &mut SolveApp, ui: &mut egui::Ui) {
                             });
                         });
                     }
-                    (true, false) => {
+                    (_, true, _) => {
+                        ui_kit::text(ui, "smed", ui_kit::Text::Hint("space_mouse_driver"));
+                    }
+                    (_, false, true) => {
                         ui_kit::text(ui, &only_spacenavd, ui_kit::Text::Hint("space_mouse_driver"));
                     }
-                    (false, _) => {
+                    (_, false, false) => {
                         ui_kit::text(ui, &only_direct, ui_kit::Text::Hint("space_mouse_driver"));
                     }
                 });
@@ -420,6 +484,7 @@ fn advanced(app: &mut SolveApp, ui: &mut egui::Ui) {
 
         // The calibrated device moving as it does, with the test model beside it, then its dead zones.
         let (device, raw) = (app.space_mouse.device.clone(), app.space_mouse.raw.into());
+        let horizon_lock = app.preferences.space_mouse_horizon_lock;
         let (boat, motion, free_orbit) = (&mut app.space_mouse.boat, app.space_mouse.motion, app.preferences.free_orbit);
         if let Some(calibration) = device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get_mut(device)) {
             ui_kit::divider(ui, "space_mouse_picture");
@@ -430,11 +495,11 @@ fn advanced(app: &mut SolveApp, ui: &mut egui::Ui) {
                 crate::space_mouse_calibration::dead_zone_pads(ui, calibration, raw, false, &stories);
                 ui_kit::text(ui, &help, ui_kit::Text::Hint("space_mouse_circles_help"));
             };
-            picture_and_boat(ui, boat, motion, free_orbit, true, |ui| crate::space_mouse_model::live(ui, calibration, raw), pads);
+            picture_and_boat(ui, boat, motion, free_orbit, horizon_lock, true, |ui| crate::space_mouse_model::live(ui, calibration, raw), pads);
         } else if device.is_some() {
             // Not calibrated: the test model alone.
             ui_kit::divider(ui, "space_mouse_picture");
-            picture_and_boat(ui, boat, motion, free_orbit, false, |_| {}, |_| {});
+            picture_and_boat(ui, boat, motion, free_orbit, horizon_lock, false, |_| {}, |_| {});
         }
     });
 }

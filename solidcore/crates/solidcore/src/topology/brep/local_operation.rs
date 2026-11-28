@@ -8,6 +8,7 @@
 //! |---------------------|---------------------------|
 //! | [`local_operation`] | `SmBrep::LocalOperation`  |
 //! | [`local_operation_simple`] | (not upstream) `SmBrep::LocalOperation` with its own notification identities |
+//! | [`transformed_face_surface`] | (not upstream) one face's support under a rigid motion |
 //!
 //! Deviations: the offset executive's local-operation geometry creator
 //! (`SmLocalOperationGeometryCreation`) is the face and surface lists the executive
@@ -33,11 +34,20 @@
 //! would leave the definition behind. (not upstream, WR-777) A given surface is turned by
 //! its normal where it passes nearest the old face's middle, not at its own domain's
 //! middle, which for a full cylinder given to a round lies across the axis.
-//! (not upstream) The static API contracts a complete cylindrical draft by subtracting
-//! its closed radial sweep (`contract_complete_cylinder`), intersecting intervening
-//! walls through their interiors. Exact support and trim predicates select that event
-//! before execution; the supplied draft definition and source attributes are preserved.
+//! (not upstream) The static API contracts a complete cylindrical or conical draft by
+//! subtracting its closed radial sweep (`contract_complete_cone`), intersecting intervening
+//! walls through their interiors. Exact trim predicates, and the two supports' one axis and
+//! slab to the body's tolerance (`coaxial_slab`), select that event before execution; the
+//! supplied draft definition and source attributes are preserved, the face's on the drafted
+//! wall and each capped end's rim's on the wall's new rim there (`rims_by_end`), as the local
+//! operation carries an edge's attributes to the edge that replaces it.
+//! (not upstream, #22804) Before the extended offset runs, a kept torus face beside a moved
+//! face whose tube direction is closed (`360°`) yet whose boundary leaves a gap around the
+//! tube gets its torus re-parameterised with its tube seam in the middle of that gap
+//! (`clear_torus_tube_seams`), so extending the torus past its trimmed rims never crosses
+//! the tube's periodic seam.
 
+use crate::math::det;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::offset::OffsetFailure;
@@ -48,7 +58,7 @@ use crate::geom::axis2_placement::Axis2Placement;
 use crate::geom::expansion as exact;
 use crate::kernel::Kernel;
 use crate::mass::enclosure::VolumeSign;
-use crate::math::{Vec3, EFF_ZERO};
+use crate::math::{Point3, Vec3, EFF_ZERO};
 use crate::nurbs::b_spline_surface::p1::{BSplineSurface, SurfParamType};
 use crate::nurbs::knots::Side;
 use crate::nurbs::math::{CPoint, NOW};
@@ -73,8 +83,9 @@ pub use crate::offset::offset_executive::p2::local_operation_simple;
 
 const OP: &str = "topology::brep::local_operation::local_operation";
 
-/// A complete cylindrical wall contracts by removing the closed radial sweep between
-/// its old and new supports. The two end planes stay fixed. Unlike boundary-only
+/// A complete cylindrical or conical wall contracts by removing the closed radial sweep
+/// between its old and new supports, `{ r_new(z) <= rho <= r_old(z) }` over the wall's
+/// axial slab (both radii affine in height). The two end planes stay fixed. Unlike boundary-only
 /// stitching, Boolean subtraction imprints the sweep on intervening cavity walls.
 /// This is selected from the supports and exact UV boundary before construction;
 /// an error never switches to another construction.
@@ -82,7 +93,7 @@ const OP: &str = "topology::brep::local_operation::local_operation";
 /// The static API owns its notification stores, so the Boolean carries the body's own
 /// attributes, including the selected face's attributes on the sweep's inner wall.
 /// The general caller-notified API continues to use its executive.
-pub(crate) fn contract_complete_cylinder(
+pub(crate) fn contract_complete_cone(
     k: &mut Kernel,
     b: &mut Brep,
     faces: &[FaceId],
@@ -127,12 +138,10 @@ pub(crate) fn contract_complete_cylinder(
     // its exact definition on the copied inner wall; neither surface is fitted here.
     if old.procedural_definition().is_some()
         || draft.source().procedural_definition().is_some()
-        || c.semi_angle_deg() != 0.0
         || c.inside_out()
         || c.rev.swap_uv()
         || d.inside_out()
         || d.rev.swap_uv()
-        || c.rev.position != d.rev.position
         || !exact::is_zero(&exact::sub(&sweep, &[360.0]))
     {
         return Ok(None);
@@ -141,50 +150,57 @@ pub(crate) fn contract_complete_cylinder(
     if new.natural_uv_domain_if_built() != domain {
         return Ok(None);
     }
-    let material_regions = bp1::regions(b, None)?
-        .into_iter()
-        .try_fold(0_usize, |n, r| {
-            Ok::<_, SolidError>(n.saturating_add(usize::from(b.region(r)?.is_void() == 0)))
-        })?;
+    let regions = bp1::regions(b, None)?;
+    let material_regions = regions.iter().try_fold(0_usize, |n, &r| {
+        Ok::<_, SolidError>(n.saturating_add(usize::from(b.region(r)?.is_void() == 0)))
+    })?;
+    // A cone (not a cylinder, which this has always taken) in a body with a closed cavity
+    // (a shelled cone) is left to the local operation, whose result for it the Boolean here
+    // does not yet reproduce (its enclosure check refuses a face between the cavity and the
+    // material).
+    let tol = b.tolerance();
     if !complete_cylinder_boundary(k, b, *f, domain)?
         || !p2::is_manifold_solid(b)?
         || material_regions != 1
-        || d.bot_height() != c.bot_height()
-        || d.top_height() != c.top_height()
+        || (regions.len() != 2 && c.semi_angle_deg() != 0.0)
     {
         return Ok(None);
     }
-    // The radius and displacement are affine in height. Exact expansion signs at
-    // both ends prove positivity and one-sided contraction over the entire slab.
-    let mut caps = [false; 2];
-    for (cap, h) in caps.iter_mut().zip([c.bot_height(), c.top_height()]) {
-        let Some(product) = exact::product(d.tan_semi_angle(), h) else {
-            return Ok(None);
-        };
-        let radius = exact::add(&[d.base_radius], &product);
-        let gap = exact::sub(&radius, &[c.base_radius]);
-        if exact::sign(&radius) <= 0 || exact::sign(&gap) > 0 {
-            return Ok(None);
-        }
-        *cap = exact::sign(&gap) < 0;
-    }
-    if !caps.iter().any(|&cap| cap) {
+    let Some(slab) = coaxial_slab(c, d, tol)? else {
+        return Ok(None);
+    };
+    if !slab.caps.iter().any(|&cap| cap) {
         return Ok(None);
     }
     draft.recertify(k, new)?;
+    let axis = (c.rev.position, 0.5 * (c.bot_height() + c.top_height()));
+    let old_rims = rims_by_end(b, *f, axis)?;
     let old = old.copy(k)?;
     let new = new.copy(k)?;
     b.with_rollback_untouched(
         |b| {
             let input = validation::standing(k, &mut b.clone_standing_for_self()?)?;
-            let mut tool = radial_sweep(k, &old, &new, caps, b.tolerance())?;
-            // The inner wall is the only drafted face, and must inherit its source's marks.
+            let mut tool = radial_sweep(k, &old, &new, &slab, b.tolerance())?;
+            // The inner wall is the only drafted face, and must inherit its source's marks;
+            // so is the wall's rim on a capped end the rim it replaces: the edge where the
+            // wall meets that end plane, which the cap moves in to the drafted support.
+            let mut pairs = vec![(EntityRef::Face(*f), EntityRef::Face(tool.1))];
+            let new_rims = rims_by_end(&tool.0, tool.1, axis)?;
+            for ((cap, from), onto) in slab.caps.iter().zip(&old_rims).zip(&new_rims) {
+                if !cap {
+                    continue;
+                }
+                for &e in from {
+                    for &to in onto {
+                        pairs.push((EntityRef::Edge(e), EntityRef::Edge(to)));
+                    }
+                }
+            }
             crate::offset::offset_executive::p2::copy_local_sweep_attributes(
                 k,
                 b,
-                *f,
+                &pairs,
                 &mut tool.0,
-                tool.1,
             )?;
             let mut result = crate::boolean::api_brep::boolean_difference(
                 k,
@@ -204,12 +220,139 @@ pub(crate) fn contract_complete_cylinder(
     Ok(Some(()))
 }
 
+/// The rims of `face`, a complete wall on a cone's slab (its boundary the two end circles and
+/// its seam, [`complete_cylinder_boundary`]), at its bottom and its top: the edges of the face
+/// that meet another face, each on the end its start vertex lies on, below or above the
+/// slab's middle height on the cone's axis (`axis`: the cone's frame and that height; the
+/// ends are the slab's, far apart beside the body's tolerance).
+fn rims_by_end(
+    b: &Brep,
+    face: FaceId,
+    (frame, middle): (Axis2Placement, f64),
+) -> Result<[Vec<crate::topology::EdgeId>; 2]> {
+    let mut rims: [Vec<crate::topology::EdgeId>; 2] = [Vec::new(), Vec::new()];
+    for e in face4::edges(b, face, None, false, None)? {
+        let beside = crate::topology::edge::faces(b, e, None)?;
+        if !beside.iter().any(|&g| g != face) {
+            continue;
+        }
+        let (Some(v), _) = crate::topology::edge::start_end_vertices(b, e)? else {
+            continue;
+        };
+        let at = (crate::topology::vertex::point(b, v)? - frame.origin()).dot(frame.z_axis());
+        let end = usize::from(at > middle);
+        if let Some(rim) = rims.get_mut(end) {
+            if !rim.contains(&e) {
+                rim.push(e);
+            }
+        }
+    }
+    Ok(rims)
+}
+
+/// The slab a drafted support `new` sweeps over with the face's support `old`: the old
+/// face's end planes (its stored heights on its own axis), each plane's height on the new
+/// support's axis, and whether the two supports' circles there differ (an annular cap) or
+/// meet (the hinge).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoaxialSlab {
+    /// The heights, on the new support's axis, of the old support's end planes at its
+    /// bottom and top heights.
+    pub(crate) heights: [f64; 2],
+    /// Whether the end is closed by an annular cap (the new radius below the old by more
+    /// than the tolerance) rather than at the hinge.
+    pub(crate) caps: [bool; 2],
+}
+
+/// [`CoaxialSlab`] of the face's support `old` and the drafted support `new`, or `None`
+/// where `new` is not the same axis and slab within the body's tolerance `tol`, or does
+/// not lie inside `old` across the slab.
+///
+/// A draft keeps its source's axis and moves each control point of its net radially at its
+/// own height ([`crate::offset::draft`]), and puts its frame's origin on the hinge circle's
+/// centre; a support recognised again after an earlier operation can carry its frame on
+/// the other end of its axis, its origin and axes off by rounding, and its stored axial
+/// interval recovered from its evaluated corners. So the frames are compared as an axis, to
+/// the body's tolerance over the slab's extent, not bit for bit: the new axis's offset from
+/// the old one plus its tilt times the extent, and the twist of the x axes (the seams)
+/// times the largest radius, are each at most `tol`; the new net's first and last rows of
+/// control points lie within `tol` of the old ones' planes, as heights on the old axis.
+/// The radii are affine in height, so their signs and the sign of the contraction at both
+/// ends hold across the slab: both radii above `tol` at both ends, the new one nowhere
+/// past the old by more than `tol`, and an end closed by a cap where it is below by more.
+fn coaxial_slab(
+    old: &crate::surface::cone::Cone,
+    new: &crate::surface::cone::Cone,
+    tol: f64,
+) -> Result<Option<CoaxialSlab>> {
+    use crate::nurbs::b_spline_curve::ControlPointForm;
+    let (po, pn) = (old.rev.position, new.rev.position);
+    let (zo, zn) = (po.z_axis(), pn.z_axis());
+    let (xo, xn) = (po.x_axis(), pn.x_axis());
+    if tol.partial_cmp(&0.0) != Some(core::cmp::Ordering::Greater)
+        || zo.dot(zn) <= 0.0
+        || xo.dot(xn) <= 0.0
+    {
+        return Ok(None);
+    }
+    let shift = (po.origin() - pn.origin()).dot(zn);
+    let old_heights = [old.bot_height(), old.top_height()];
+    let heights = old_heights.map(|h| h + shift);
+    let was = old_heights.map(|h| old.radius(h));
+    let now = [new.radius(heights[0]), new.radius(heights[1])];
+    let extent = old_heights
+        .iter()
+        .chain(&heights)
+        .fold(0.0_f64, |m, h| m.max(h.abs()));
+    let reach = was.iter().chain(&now).fold(0.0_f64, |m, r| m.max(r.abs()));
+    let away = pn.origin() - po.origin();
+    let off = (away - zo * away.dot(zo)).length();
+    let tilt = zo.cross(zn).length();
+    let twist = xo.cross(xn).length();
+    if !(off + tilt * extent <= tol && twist * reach <= tol) {
+        return Ok(None);
+    }
+    let mut caps = [false; 2];
+    for ((cap, w), n) in caps.iter_mut().zip(was).zip(now) {
+        let gap = n - w;
+        if !(w > tol && n > tol && gap <= tol) {
+            return Ok(None);
+        }
+        *cap = gap < -tol;
+    }
+    // the drafted net's end rows on the old end planes
+    let (a, z) = (old.rev.base(), new.rev.base());
+    let nu = a.number_control_points(SurfParamType::U);
+    let nv = a.number_control_points(SurfParamType::V);
+    let Some(last) = nv.checked_sub(1) else {
+        return Ok(None);
+    };
+    if z.number_control_points(SurfParamType::U) != nu
+        || z.number_control_points(SurfParamType::V) != nv
+    {
+        return Ok(None);
+    }
+    for j in [0, last] {
+        for i in 0..nu {
+            let (p, _) = a.control_point(ControlPointForm::EuclideanRational, i, j)?;
+            let (q, _) = z.control_point(ControlPointForm::EuclideanRational, i, j)?;
+            let along = (q - p).dot(zo).abs();
+            if along.partial_cmp(&tol) == Some(core::cmp::Ordering::Greater) || along.is_nan() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(CoaxialSlab { heights, caps }))
+}
+
 /// The four exact box sides, and bare planar faces across both circular rims.
 ///
 /// The exact UV box proves each rim is the cylinder's own iso circle at its stored
-/// end height, which is where the tool's caps lie. The face across a rim shares that
-/// edge, so a bare plane there is an end plane of the slab within the body's own
-/// validity; it stays the result's support, trimmed by the cone. Its fitted frame is
+/// end height, which is where the tool's caps lie. A rim may come in pieces end to end
+/// (other faces meeting it at vertices along it); each piece lies on the rim's iso line,
+/// so the face across it shares an arc of that circle and a bare plane there holds the
+/// circle: an end plane of the slab within the body's own validity, whichever side it
+/// faces. It stays the result's support, trimmed by the cone. Its fitted frame is
 /// not compared with the cylinder: the body's construction rounds it, and the
 /// removal volume is defined by the cylinder alone.
 fn complete_cylinder_boundary(
@@ -226,10 +369,13 @@ fn complete_cylinder_boundary(
         return Ok(false);
     }
     let uses = eu::faceuse_edgeuses(b, fu, false, None)?;
-    if uses.len() != 4 {
+    if uses.len() < 4 {
         return Ok(false);
     }
     let mut sides = BTreeSet::new();
+    // (#19699) a rim may be split into pieces where other faces meet it (a pad on the end
+    // face whose corner pokes past the rim): each piece's span along its rim
+    let mut pieces: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
     for u in uses {
         let Some(curve) = eu::uv_trim_curve(b, u)?.0 else {
             return Ok(false);
@@ -238,7 +384,7 @@ fn complete_cylinder_boundary(
         let Some(line) = uv_line(k, curve)? else {
             return Ok(false);
         };
-        let mut side = None;
+        let mut side: Option<(usize, (f64, f64))> = None;
         for (i, in_u, value, low, high) in [
             (0, true, domain.min().x, domain.min().y, domain.max().y),
             (1, true, domain.max().x, domain.min().y, domain.max().y),
@@ -246,20 +392,26 @@ fn complete_cylinder_boundary(
             (3, false, domain.max().y, domain.min().x, domain.max().x),
         ] {
             let [a, z] = line.ends;
+            let span = (
+                coordinate(a, !in_u).min(coordinate(z, !in_u)),
+                coordinate(a, !in_u).max(coordinate(z, !in_u)),
+            );
+            // a seam use runs the whole side; a rim use some of it
             if line.points.iter().all(|&p| {
                 coordinate(p, in_u) == value
                     && coordinate(p, !in_u) >= low
                     && coordinate(p, !in_u) <= high
-            }) && coordinate(a, !in_u).min(coordinate(z, !in_u)) == low
-                && coordinate(a, !in_u).max(coordinate(z, !in_u)) == high
+            }) && (i >= 2 || span == (low, high))
             {
-                side = Some(i);
+                side = Some((i, span));
             }
         }
-        let Some(side) = side else {
+        let Some((side, span)) = side else {
             return Ok(false);
         };
-        if !sides.insert(side) {
+        if let Some(rim) = side.checked_sub(2).and_then(|r| pieces.get_mut(r)) {
+            rim.push(span);
+        } else if !sides.insert(side) {
             return Ok(false);
         }
         if side >= 2 {
@@ -280,28 +432,57 @@ fn complete_cylinder_boundary(
             }
         }
     }
-    Ok(true)
+    // Both seams once each, and each rim's pieces end to end over its whole side: sorted,
+    // the first from the side's start, each from where the one before it ends, the last to
+    // the side's end, exactly where it ends at a seam, as a whole rim always has. Two pieces
+    // meet at a vertex of the loop, whose parameters both uses' UV trims end at, each found
+    // from the vertex on the one surface: they agree to `uv_rounding`, and a piece starting
+    // farther from where the last ended (a hole in the rim, or two pieces over one arc)
+    // leaves the wall to the local operation.
+    let (low, high) = (domain.min().x, domain.max().x);
+    let r = uv_rounding(low.abs().max(high.abs()).max((high - low).abs()));
+    let covers = |rim: &mut Vec<(f64, f64)>| {
+        rim.sort_by(|p, q| p.0.total_cmp(&q.0));
+        let mut at: Option<f64> = None;
+        for &(from, to) in rim.iter() {
+            let joined = at.map_or(from == low, |at| (from - at).abs() <= r);
+            if !joined || to <= from {
+                return false;
+            }
+            at = Some(to);
+        }
+        at == Some(high)
+    };
+    let [bottom, top] = &mut pieces;
+    Ok(sides.len() == 2 && covers(bottom) && covers(top))
 }
 
-/// A perpendicular rim plane through the exact axial endpoint, before rounding a
-/// point or a cross product: the tool's own cap support, built from the defining
-/// circles, must be exactly the cylinder's end plane.
-fn fixed_rim_plane(p: &Axis2Placement, cylinder: &crate::surface::cone::Cone, h: f64) -> bool {
+/// A rim plane square to the cylinder's axis through the rims' own centre `centre`, proved
+/// on the stored numbers before rounding a point or a cross product: the tool's cap support,
+/// built from the defining circles, must be exactly the plane they were drawn on.
+///
+/// `centre` is the end point `origin + h z` of the cylinder's axis as the rims were built,
+/// rounded once. The exact sum is in general not a double (an origin at z = 0.3 and an end
+/// height 0.7 give 0.3 + 0.7, which rounds), so no stored centre or plane lies exactly on it;
+/// the check proves the cap is on the plane of the very point both rims are drawn about, one
+/// value for both, not on an exact end plane no stored plane can be on.
+fn fixed_rim_plane(
+    p: &Axis2Placement,
+    cylinder: &crate::surface::cone::Cone,
+    centre: Point3,
+) -> bool {
     let (x, y) = (p.x_axis(), p.y_axis());
     let frame = cylinder.rev.position;
-    let axis = frame.z_axis();
     let prove = || {
         if !exact::is_zero(&exact::det3(frame.x_axis(), frame.y_axis(), x)?)
             || !exact::is_zero(&exact::det3(frame.x_axis(), frame.y_axis(), y)?)
         {
             return Some(false);
         }
-        let height = exact::scale(&exact::det3(x, y, axis)?, h)?;
-        let origin = exact::sub(
-            &exact::det3(x, y, frame.origin())?,
+        Some(exact::is_zero(&exact::sub(
+            &exact::det3(x, y, centre)?,
             &exact::det3(x, y, p.origin())?,
-        );
-        Some(exact::is_zero(&exact::add(&origin, &height)))
+        )))
     };
     prove() == Some(true)
 }
@@ -311,7 +492,7 @@ fn radial_sweep(
     k: &mut Kernel,
     old: &Surface,
     new: &Surface,
-    caps: [bool; 2],
+    slab: &CoaxialSlab,
     tolerance: f64,
 ) -> Result<(Brep, FaceId)> {
     use crate::curve::curve::CurveKind;
@@ -334,34 +515,40 @@ fn radial_sweep(
     let inner_surface = new.copy(k)?;
     crate::topology::brep::sheet::face_on(k, &mut tool, outer_surface, &domain)?;
     let inner = crate::topology::brep::sheet::face_on(k, &mut tool, inner_surface, &domain)?;
-    for ((height, target_height), cap) in [
-        (cylinder.bot_height(), target.bot_height()),
-        (cylinder.top_height(), target.top_height()),
-    ]
-    .into_iter()
-    .zip(caps)
+    // The slab is the old support's: each cap lies on its end plane, and both its circles
+    // are drawn in the old support's frame there, the outer one of the old radius and the
+    // inner one of the target's radius at that plane's height on the target's axis
+    // (`slab.heights`). The target's own stored interval is not used: it is recovered from
+    // its net and may differ by rounding from the plane its end row lies in, and its frame
+    // may stand off the old one by rounding (`coaxial_slab`).
+    for ((height, target_height), cap) in [cylinder.bot_height(), cylinder.top_height()]
+        .into_iter()
+        .zip(slab.heights)
+        .zip(slab.caps)
     {
         if !cap {
             continue;
         }
         // Define the rims from the supports themselves. An iso curve's sampled
         // radius is not a defining radius and must not become the cap's support.
-        let rim = |cone: &crate::surface::cone::Cone, h: f64| -> Result<_> {
-            let frame = cone.rev.position;
+        // Both rims are drawn about one centre, the end point rounded once, and the cap is
+        // proved to lie on the plane through that same point (`fixed_rim_plane`).
+        let frame = cylinder.rev.position;
+        let centre = frame.origin() + height * frame.z_axis();
+        let rim = |radius: f64| -> Result<_> {
             let mut circle = crate::curve::ellipse::Ellipse::empty_circle();
-            circle.position = Axis2Placement::from_stored(
-                frame.origin() + h * frame.z_axis(),
-                frame.x_axis(),
-                frame.y_axis(),
-            );
-            circle.anal_domain = cone.rev.anal_uv_domain.u_interval();
-            circle.radius_x = cone.radius(h);
+            circle.position = Axis2Placement::from_stored(centre, frame.x_axis(), frame.y_axis());
+            circle.anal_domain = cylinder.rev.anal_uv_domain.u_interval();
+            circle.radius_x = radius;
             circle.radius_y = circle.radius_x;
             circle.make_nurb(k)?;
             circle.base.form = crate::nurbs::b_spline_curve::BSplineCurveForm::CircularArc;
             Ok(crate::curve::curve::Curve::from(circle))
         };
-        let curves = [rim(cylinder, height)?, rim(target, target_height)?];
+        let curves = [
+            rim(cylinder.radius(height))?,
+            rim(target.radius(target_height))?,
+        ];
         let [outer, inner] = &curves;
         let (CurveKind::Ellipse(a), CurveKind::Ellipse(z)) = (outer.kind(), inner.kind()) else {
             return Err(SolidError::topology(
@@ -388,7 +575,7 @@ fn radial_sweep(
                 TopologyFailure::RadialCapWithoutPlane,
             ));
         };
-        if !fixed_rim_plane(support.position(), cylinder, height) {
+        if !fixed_rim_plane(support.position(), cylinder, centre) {
             return Err(SolidError::topology(
                 OP,
                 TopologyFailure::RadialRimsOffEndPlane,
@@ -563,6 +750,7 @@ fn local_operation_on(
             }
         }
     }
+    clear_torus_tube_seams(k, b, &all_faces, &moving)?;
     let mut continued = continued_planes(k, b, &all_faces, &moving)?;
     for &face in &all_faces {
         let index = faces.iter().position(|&f| f == face);
@@ -839,7 +1027,7 @@ impl Meridian {
             (d - axis * d.dot(axis)).length() <= tolerance
         };
         let line = |a: f64, b: f64, c: f64| {
-            let length = a.hypot(b);
+            let length = det::hypot(a, b);
             (length > 0.0 && length.is_finite() && c.is_finite()).then(|| Self {
                 n: (a / length, b / length),
                 c: c / length,
@@ -862,7 +1050,7 @@ impl Meridian {
             } => {
                 let sigma = along(placement.z_axis())?;
                 on_axis(placement.origin()).then_some(())?;
-                let slope = sigma * semi_angle_deg.to_radians().tan();
+                let slope = sigma * det::tan(semi_angle_deg.to_radians());
                 line(
                     1.0,
                     -slope,
@@ -1040,6 +1228,204 @@ fn closing_band(
         }
     }
     Ok(first.map(|(_, face, beside, largest)| (face, beside, largest)))
+}
+
+/// (not upstream, #22804) Moves the tube seam (`v` seam) of every kept closed-tube torus
+/// face that borders a moved face into the middle of the widest gap its boundary leaves
+/// around the tube.
+///
+/// A torus primitive is doubly periodic (`[0°, 360°] × [0°, 360°]`), with its tube seam
+/// along the outer equator `v = 0° / 360°`. Cutting a half-torus at `z = 0` leaves that
+/// closed torus on the face with its outer rim lying right on `v = 0°` and its boundary
+/// covering only `v ∈ [0°, 180°]`. Moving the flat cut face outward (`z = 0 → z = -d`)
+/// extends the torus into `v < 0°`, across the `v = 0° / 360°` periodic seam: the meridian
+/// seam edge's extended minor circle has its seam at `v = 0°`, so no single parameter
+/// interval of that circle gives the extended arc (`trim_extended_edge_ends`), leaving the
+/// meridian seam unextended and failing `step_gaps` with `LoopGapUncertified`.
+///
+/// Re-parameterising the same analytic torus over `[u_min, u_max] × [v_seam, v_seam + 360°]`
+/// with `v_seam` in the middle of the unused complement arc (for a half-torus `z ≥ 0`,
+/// `v_seam = 270°` at the bottom of the tube) moves no point of the surface, preserves its
+/// orientation and topology, keeps the tube seam strictly off the face, and gives equal
+/// clearance on both rims for any outward move up to the tube's full room.
+fn clear_torus_tube_seams(
+    k: &Kernel,
+    b: &mut Brep,
+    all_faces: &[FaceId],
+    moving: &[FaceId],
+) -> Result<()> {
+    use crate::geom::extent2d::Extent2d;
+    use crate::geom::vector2d::Point2;
+    use crate::math::EFF_ZERO_DEG;
+    use crate::surface::torus::{Torus, TorusOptions};
+    use crate::topology::edge;
+    use crate::topology::face::p1 as face1;
+
+    for &face in all_faces {
+        if moving.contains(&face) {
+            continue;
+        }
+        let mut touches_moving = false;
+        for e in face4::edges(b, face, None, false, None)? {
+            if edge::faces(b, e, None)?
+                .iter()
+                .any(|&n| n != face && moving.contains(&n))
+            {
+                touches_moving = true;
+                break;
+            }
+        }
+        if !touches_moving {
+            continue;
+        }
+        let Some(surface) = face_ops::surface(b, face)? else {
+            continue;
+        };
+        if surface.procedural_definition().is_some() {
+            continue;
+        }
+        let SurfaceKind::Torus(torus) = surface.kind() else {
+            continue;
+        };
+        if !torus.base().have_polar_conversion() {
+            continue;
+        }
+        let anal = torus.base().step_uv_domain();
+        let v_ivl = anal.v_interval();
+        if (v_ivl.length() - 360.0).abs() > EFF_ZERO_DEG {
+            continue;
+        }
+        let position = *torus.base().position();
+        let major = torus.major_radius();
+        let minor = torus.minor_radius();
+        let swap_uv = torus.base().swap_uv();
+        let inside_out = torus.inside_out();
+        let u_ivl = anal.u_interval();
+        let cur_seam = v_ivl.min().rem_euclid(360.0);
+
+        let uv_box =
+            face1::calculate_uv_domain_from_uv_trim_curves(k, b, face, true, false, false)?.domain;
+        let Some(surface) = face_ops::surface(b, face)? else {
+            continue;
+        };
+        let nurb_dom = surface.natural_uv_domain_with_nurb(k)?;
+        let SurfaceKind::Torus(torus) = surface.kind() else {
+            continue;
+        };
+        let (gen_face, gen_surf, mid_other) = if swap_uv {
+            (
+                uv_box.u_interval(),
+                nurb_dom.u_interval(),
+                nurb_dom.v_interval().mid(),
+            )
+        } else {
+            (
+                uv_box.v_interval(),
+                nurb_dom.v_interval(),
+                nurb_dom.u_interval().mid(),
+            )
+        };
+        let surf_len = gen_surf.length();
+        let face_len = gen_face.length();
+        if !(surf_len.is_finite()
+            && face_len.is_finite()
+            && face_len > EFF_ZERO * (1.0 + surf_len)
+            && face_len < surf_len * (1.0 - 1.0 / 360.0))
+        {
+            continue;
+        }
+        let pt = |g: f64| {
+            if swap_uv {
+                Point2::new(g, mid_other)
+            } else {
+                Point2::new(mid_other, g)
+            }
+        };
+        let a_lo = torus
+            .convert_uv_from_nurbs_to_step(k, pt(gen_face.min()))?
+            .y;
+        let a_mid = torus
+            .convert_uv_from_nurbs_to_step(k, pt(gen_face.mid()))?
+            .y;
+        let a_hi = torus
+            .convert_uv_from_nurbs_to_step(k, pt(gen_face.max()))?
+            .y;
+        if !(a_lo.is_finite() && a_mid.is_finite() && a_hi.is_finite()) {
+            continue;
+        }
+        let (d_lo, d_hi) = if inside_out {
+            (
+                (a_lo - a_mid).rem_euclid(360.0),
+                (a_mid - a_hi).rem_euclid(360.0),
+            )
+        } else {
+            (
+                (a_mid - a_lo).rem_euclid(360.0),
+                (a_hi - a_mid).rem_euclid(360.0),
+            )
+        };
+        let span = d_lo + d_hi;
+        let gap = 360.0 - span;
+        if !(d_lo > 0.0 && d_hi > 0.0 && gap > 1.0) {
+            continue;
+        }
+        let v_hi = if inside_out {
+            a_mid + d_lo
+        } else {
+            a_mid + d_hi
+        };
+        let v_seam = (v_hi + 0.5 * gap).rem_euclid(360.0);
+        let diff = (v_seam - cur_seam).rem_euclid(360.0);
+        if diff.min(360.0 - diff) <= 0.36 {
+            continue;
+        }
+
+        let new_step_domain =
+            Extent2d::from_bounds(u_ivl.min(), v_seam, u_ivl.max(), v_seam + 360.0);
+        let new_torus = Surface::from(Torus::create_canonical(
+            k,
+            &position,
+            major,
+            minor,
+            TorusOptions {
+                swap_uv,
+                inside_out,
+                circle_nurb: None,
+            },
+            Some(&new_step_domain),
+        )?);
+
+        let editing = b.editing_enabled();
+        b.set_editing_enabled(true);
+        let replaced = (|| -> Result<()> {
+            let mut state = p2::ArenaNotifyState::new(b);
+            let mut env = state.env(None);
+            let face_ref = b
+                .face(face)?
+                .surface
+                .as_ref()
+                .and_then(Surface::owner)
+                .unwrap_or_else(|| (env.key_of)(EntityRef::Face(face)));
+            p2::replace_surface(
+                k,
+                b,
+                &mut env,
+                face,
+                new_torus,
+                face_ref,
+                p2::OldSurface::Delete,
+                true,
+            )?;
+            let uv_domain =
+                face1::calculate_uv_domain_from_uv_trim_curves(k, b, face, false, false, false)?
+                    .domain;
+            face_ops::set_uv_domain(b, face, &uv_domain)?;
+            Ok(())
+        })();
+        b.set_editing_enabled(editing);
+        replaced?;
+    }
+    Ok(())
 }
 
 /// (not upstream) The planes faces that keep their surfaces continue as: a face whose
@@ -1522,6 +1908,144 @@ fn keeps_seams(k: &Kernel, b: &mut Brep, face: FaceId, surface: &Surface) -> Res
     Ok(true)
 }
 
+/// A checked rigid motion of a face. Keep the original axis and displacement for
+/// exact tangency decisions, which rounding a transformed frame could change.
+#[derive(Debug)]
+pub struct FaceMotion {
+    axis: Vec3,
+    translate: Vec3,
+    angle: f64,
+    placement: Axis2Placement,
+}
+
+impl FaceMotion {
+    /// Rotate about `axis` through `origin` by `angle` radians, then translate.
+    ///
+    /// # Errors
+    /// A non-finite argument, a zero rotation axis, or an overflowing placement.
+    pub fn new(translate: Vec3, origin: Vec3, axis: Vec3, angle: f64) -> Result<Self> {
+        let invalid = |reason| SolidError::invalid_input("FaceMotion::new", reason);
+        let finite = |p: Vec3| p.to_array().into_iter().all(f64::is_finite);
+        if !(finite(origin) && finite(translate) && angle.is_finite()) {
+            return Err(invalid("non-finite pivot, translation or angle"));
+        }
+        let (_, unit) = axis
+            .length_and_unit()
+            .ok_or_else(|| invalid("non-finite or zero rotation axis"))?;
+        let mut placement = Axis2Placement::IDENTITY;
+        if angle != 0.0 {
+            placement.rotate_about_axis_at_point(angle, origin, unit);
+        }
+        placement.translate(translate);
+        if !finite(placement.origin()) {
+            return Err(invalid("the pivoted motion overflows its placement"));
+        }
+        Ok(Self {
+            axis,
+            translate,
+            angle,
+            placement,
+        })
+    }
+}
+
+/// The selected face's support under `motion`. Returns `None` for an invariant
+/// support; otherwise the replacement is an independent copy, including its definition.
+///
+/// # Errors
+///
+/// A missing face or surface, a motion the surface transform cannot represent,
+/// or the copy or transform's own error.
+pub fn transformed_face_surface(
+    k: &Kernel,
+    b: &Brep,
+    face: FaceId,
+    motion: &FaceMotion,
+) -> Result<Option<Surface>> {
+    const TRANSFORM: &str = "topology::brep::local_operation::transformed_face_surface";
+    let invalid = |reason| SolidError::invalid_input(TRANSFORM, reason);
+    let (translate, axis, angle) = (motion.translate, motion.axis, motion.angle);
+    let own = face_ops::surface(b, face)?
+        .ok_or_else(|| SolidError::topology(TRANSFORM, TopologyFailure::FaceWithoutSurface))?;
+    if angle == 0.0 && translate == Vec3::ZERO {
+        return Ok(None);
+    }
+
+    // Test a translation on the original support: adding it to a distant origin
+    // can round a tangent vector out of its plane, or erase a real normal move.
+    let invariant = match own.kind() {
+        SurfaceKind::Plane(p) => {
+            let p = p.position();
+            let (x, y) = (p.x_axis(), p.y_axis());
+            if spans(p) == Some(true)
+                && (angle == 0.0
+                    || [x, y]
+                        .into_iter()
+                        .all(|v| exact::dot(v, axis).is_some_and(|d| exact::is_zero(&d))))
+            {
+                exact::det3(x, y, translate).map(|d| exact::is_zero(&d))
+            } else {
+                None
+            }
+        }
+        SurfaceKind::Cone(c) if angle == 0.0 && c.cylinder => {
+            let p = &c.rev.position;
+            exact::dot(p.x_axis(), translate)
+                .zip(exact::dot(p.y_axis(), translate))
+                .map(|(x, y)| exact::is_zero(&x) && exact::is_zero(&y))
+        }
+        SurfaceKind::Cone(_) | SurfaceKind::Sphere(_) | SurfaceKind::Torus(_) if angle == 0.0 => {
+            Some(false)
+        }
+        SurfaceKind::BSpline(net) if angle == 0.0 && own.procedural_definition().is_none() => {
+            net_slides_in_plane(net, translate)
+        }
+        _ => None,
+    };
+    if invariant == Some(true) {
+        return Ok(None);
+    }
+    // The surface transform itself skips placements within EFF_ZERO of identity.
+    // That is not a proof of an invariant support. Do not retrim on an unmoved
+    // copy (or silently accept a genuinely normal displacement) in that case.
+    if motion.placement.is_identity(EFF_ZERO) {
+        return Err(invalid(
+            "the face's rigid motion is below the surface transform's resolution",
+        ));
+    }
+    let mut moved = own.copy(k)?;
+    moved.transform(k, &motion.placement, None)?;
+    if is_own_surface(own, &moved) {
+        if invariant == Some(false) {
+            return Err(invalid(
+                "the displacement is not resolved on the face's support",
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(moved))
+}
+
+/// A bare net whose control points all lie in a plane parallel to `delta` slides
+/// in that plane. A chord not parallel to `delta` nominates the second direction;
+/// rounding that chord cannot produce a false positive: [`net_plane_coordinate`]
+/// tests every homogeneous point against the two *stored* directions exactly.
+fn net_slides_in_plane(net: &BSplineSurface, delta: Vec3) -> Option<bool> {
+    let mut pts = net.gw_nurb()?.rows().flatten().map(|c| {
+        let h = Vec3::new(c.x, c.y, c.z);
+        if c.w == NOW {
+            h
+        } else {
+            h / c.w
+        }
+    });
+    let origin = pts.next()?;
+    let chord = pts.map(|p| p - origin).find(|&v| {
+        exact::cross(delta, v).is_some_and(|cross| cross.iter().any(|c| !exact::is_zero(c)))
+    })?;
+    net_plane_coordinate(net, delta, chord).map(|_| true)
+}
+
 /// Whether `given` is the surface `own` lies on, exactly: both of one analytic kind
 /// ([`AnalyticSupport`]) with equal radii and semi-angle, and the same placement where it
 /// matters, each comparison made without rounding (error-free products and sums,
@@ -1714,25 +2238,10 @@ fn own_plane_moved_origin(p: &Axis2Placement, q: &Axis2Placement) -> Option<Vec3
         .then_some(origin)
 }
 
-/// The translation along `q`'s rounded normal that moves `net`'s plane onto `q`'s plane.
-/// Exact determinants of `q`'s stored axes prove the homogeneous control points have
-/// the same plane coordinate per positive finite weight. The displacement uses the
-/// matching determinant ratio; its doubles are estimates ([`exact::to_f64`]). The sense
-/// is `own`'s evaluated normal against `q`'s rounded normal, finite and positive.
-fn net_moved_translation(
-    net: &BSplineSurface,
-    k: &Kernel,
-    own: &Surface,
-    q: &Axis2Placement,
-) -> Option<Vec3> {
-    let (x, y, m, g) = (q.x_axis(), q.y_axis(), q.z_axis(), q.origin());
-    // a degenerate given frame has no normal to be parallel to (`z_axis` is (0, 0, 1) for
-    // parallel or zero axes)
-    if !spans(q)? {
-        return None;
-    }
-    // det(x, y, H_i)*w0 = det(x, y, H_0)*wi, not H_i dot m: unitizing the
-    // cross product rounds m, so its exact perpendicular plane can differ from q's.
+/// The common coordinate `det(x, y, H_i)/w_i` of all the net's control points,
+/// as its first point's weight and determinant. Exact even for a rational net:
+/// compare the cross products of the two fractions, not rounded Euclidean points.
+fn net_plane_coordinate(net: &BSplineSurface, x: Vec3, y: Vec3) -> Option<(f64, Vec<f64>)> {
     let nurb = net.gw_nurb()?;
     let weight = |c: &CPoint| if c.w == NOW { 1.0 } else { c.w };
     let first = nurb.rows().flatten().next()?;
@@ -1754,6 +2263,29 @@ fn net_moved_translation(
             return None;
         }
     }
+    Some((w0, a0))
+}
+
+/// The translation along `q`'s rounded normal that moves `net`'s plane onto `q`'s plane.
+/// Exact determinants of `q`'s stored axes prove the homogeneous control points have
+/// the same plane coordinate per positive finite weight. The displacement uses the
+/// matching determinant ratio; its doubles are estimates ([`exact::to_f64`]). The sense
+/// is `own`'s evaluated normal against `q`'s rounded normal, finite and positive.
+fn net_moved_translation(
+    net: &BSplineSurface,
+    k: &Kernel,
+    own: &Surface,
+    q: &Axis2Placement,
+) -> Option<Vec3> {
+    let (x, y, m, g) = (q.x_axis(), q.y_axis(), q.z_axis(), q.origin());
+    // a degenerate given frame has no normal to be parallel to (`z_axis` is (0, 0, 1) for
+    // parallel or zero axes)
+    if !spans(q)? {
+        return None;
+    }
+    // det(x, y, H_i)*w0 = det(x, y, H_0)*wi, not H_i dot m: unitizing the
+    // cross product rounds m, so its exact perpendicular plane can differ from q's.
+    let (w0, a0) = net_plane_coordinate(net, x, y)?;
     // a net whose normal cannot be evaluated is not shown this construction
     let domain = own.natural_uv_domain_with_nurb(k).ok()?;
     let own_normal = own
@@ -2057,13 +2589,31 @@ mod tests {
             Attribute::long(62002, 9, Behavior::Temp),
         )
         .unwrap();
+        // the top rim, which the cap moves in to the drafted wall
+        let rim_at = |b: &Brep, e| {
+            let (v, _) = crate::topology::edge::start_end_vertices(b, e).unwrap();
+            crate::topology::vertex::point(b, v.unwrap()).unwrap()
+        };
+        let top_rim = face4::edges(&b, f, None, false, None)
+            .unwrap()
+            .into_iter()
+            .find(|&e| {
+                crate::topology::edge::faces(&b, e, None).unwrap().len() == 2
+                    && (rim_at(&b, e).z - 20.0).abs() < 1e-9
+            })
+            .unwrap();
+        b.add_attribute(
+            EntityRef::Edge(top_rim),
+            Attribute::long(62003, 5, Behavior::Copy),
+        )
+        .unwrap();
         let cylinder = b.face(f).unwrap().surface.as_ref().unwrap();
         for neutral in [0.0, -10.0] {
             let draft = Draft::new(
                 Point3::new(0.0, 0.0, neutral),
                 Vec3::Z,
                 Vec3::Z,
-                0.1_f64.atan(),
+                det::atan(0.1_f64),
             )
             .unwrap();
             let cone = draft_surface(&k, &b, f, &draft).unwrap().unwrap();
@@ -2071,7 +2621,7 @@ mod tests {
                 let mut contracted = b.clone_standing_for_self().unwrap();
                 let target = cone.copy(&k).unwrap();
                 assert_eq!(
-                    contract_complete_cylinder(&mut k, &mut contracted, &[f], &[target]).unwrap(),
+                    contract_complete_cone(&mut k, &mut contracted, &[f], &[target]).unwrap(),
                     Some(())
                 );
                 let (volume, manifold) = volume_and_manifold(&k, &mut contracted);
@@ -2102,17 +2652,38 @@ mod tests {
                     panic!("the resulting wall lost its draft definition");
                 };
                 assert_eq!(draft.recertify(&k, moved).unwrap(), 0.0);
+                // the new top rim, of radius 8 at z = 20 on the drafted wall, stands for the
+                // old one
+                let rims: Vec<_> = bp1::edges(&contracted, None)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|&e| {
+                        contracted
+                            .find_attribute(EntityRef::Edge(e), 62003)
+                            .is_some()
+                    })
+                    .collect();
+                assert_eq!(rims.len(), 1);
+                let p = rim_at(&contracted, rims[0]);
+                assert!((p.z - 20.0).abs() < 1e-9, "{p:?}");
+                assert!(((p.x * p.x + p.y * p.y).sqrt() - 8.0).abs() < 1e-9, "{p:?}");
+                assert!(crate::topology::edge::faces(&contracted, rims[0], None)
+                    .unwrap()
+                    .contains(&marked[0]));
             }
-            let (mut tool, inner) = radial_sweep(
-                &mut k,
-                cylinder,
-                &cone,
-                [neutral != 0.0, true],
-                b.tolerance(),
-            )
-            .unwrap();
+            let (SurfaceKind::Cone(c), SurfaceKind::Cone(d)) = (cylinder.kind(), cone.kind())
+            else {
+                panic!("a cylinder drafted is a cone");
+            };
+            let slab = coaxial_slab(c, d, b.tolerance()).unwrap().unwrap();
+            assert_eq!(slab.caps, [neutral != 0.0, true]);
+            let (mut tool, inner) =
+                radial_sweep(&mut k, cylinder, &cone, &slab, b.tolerance()).unwrap();
             crate::offset::offset_executive::p2::copy_local_sweep_attributes(
-                &mut k, &b, f, &mut tool, inner,
+                &mut k,
+                &b,
+                &[(EntityRef::Face(f), EntityRef::Face(inner))],
+                &mut tool,
             )
             .unwrap();
             assert!(matches!(
@@ -2136,15 +2707,53 @@ mod tests {
         }
     }
 
+    /// A cylinder of radius 1 standing on z = 0.3 to the height 0.7, drafted 1 in 10 about
+    /// its bottom: its top rim's centre 0.3 + 0.7 is not a double and rounds. The removal is
+    /// still the cylinder less the frustum of radii 1 and 0.93, closed by an annular cap on
+    /// the plane through the rims' one rounded centre, not refused as off its end plane.
+    #[test]
+    fn a_cylinder_whose_top_rounds_contracts_with_a_cap_on_its_rims_plane() {
+        use crate::offset::draft::{draft_surface, Draft};
+        let mut k = Kernel {
+            fixes: UpstreamFixes::all(),
+            ..Kernel::default()
+        };
+        let origin = Point3::new(0.1, 0.2, 0.3);
+        let mut b =
+            crate::primitive::api_primitives::create_cylinder(&mut k, origin, 1.0, 0.7).unwrap();
+        let f = bp1::faces(&b, None)
+            .unwrap()
+            .into_iter()
+            .find(|&f| {
+                matches!(
+                    b.face(f).unwrap().surface.as_ref().unwrap().kind(),
+                    SurfaceKind::Cone(_)
+                )
+            })
+            .unwrap();
+        let draft = Draft::new(origin, Vec3::Z, Vec3::Z, det::atan(0.1_f64)).unwrap();
+        let cone = draft_surface(&k, &b, f, &draft).unwrap().unwrap();
+        assert_eq!(
+            contract_complete_cone(&mut k, &mut b, &[f], &[cone]).unwrap(),
+            Some(())
+        );
+        let (volume, manifold) = volume_and_manifold(&k, &mut b);
+        let expected = core::f64::consts::PI * 0.7 * (1.0 + 0.93 + 0.93 * 0.93) / 3.0;
+        assert!(
+            manifold && (volume - expected).abs() <= 1e-9 * expected,
+            "{volume} vs {expected}"
+        );
+    }
+
     #[test]
     fn parallel_plane_origin_uses_determinants_before_rounding_the_origin_difference() {
         let k = Kernel::default();
-        let t = 2.0_f64.powi(-25) + 2.0_f64.powi(-77);
+        let t = det::powi(2.0_f64, -25) + det::powi(2.0_f64, -77);
         let x = Vec3::new(1.0, t, 0.0);
         let y = Vec3::Z;
         let domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
         let scale = crate::math::Vec2::new(1.0, 1.0);
-        let origin = x * 2.0_f64.powi(-53);
+        let origin = x * det::powi(2.0_f64, -53);
         let own = Surface::from(Plane::new(origin, x, y, scale, &domain));
         let coincident = Surface::from(Plane::new(x, x, y, scale, &domain));
         // Both origins lie exactly in the stored axis span, but rounding x-origin
@@ -2180,7 +2789,7 @@ mod tests {
     #[test]
     fn parallel_net_moves_every_control_point_using_the_given_stored_plane_axes() {
         let k = Kernel::default();
-        let t = 2.0_f64.powi(-25) + 2.0_f64.powi(-77);
+        let t = det::powi(2.0_f64, -25) + det::powi(2.0_f64, -77);
         let x = Vec3::new(1.0, t, 0.0);
         let y = Vec3::Z;
         let domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
@@ -2235,7 +2844,7 @@ mod tests {
     #[test]
     fn perpendicularity_to_the_rounded_normal_does_not_prove_parallel_planes() {
         let k = Kernel::default();
-        let t = 2.0_f64.powi(-25) + 2.0_f64.powi(-77);
+        let t = det::powi(2.0_f64, -25) + det::powi(2.0_f64, -77);
         let x = Vec3::new(1.0, t, 0.0);
         let y = Vec3::Z;
         let domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
@@ -2252,7 +2861,7 @@ mod tests {
             .is_none());
         // Scaling amplifies the mismatch in the control coordinates. It remains
         // exactly perpendicular to m, but not in the given plane's stored span.
-        let a = a * 2.0_f64.powi(80);
+        let a = a * det::powi(2.0_f64, 80);
         assert!(exact::is_zero(&exact::dot(m, a).unwrap()));
         assert!(!exact::is_zero(&exact::det3(x, y, a).unwrap()));
         let own_net = Surface::from(
@@ -2682,7 +3291,12 @@ mod tests {
             .unwrap()
             .unwrap()
             .clone();
-        given_its_own(k, b, s, 4.0 / 3.0 * std::f64::consts::PI * 1.5_f64.powi(3));
+        given_its_own(
+            k,
+            b,
+            s,
+            4.0 / 3.0 * std::f64::consts::PI * det::powi(1.5_f64, 3),
+        );
     }
 
     #[test]
@@ -2691,7 +3305,7 @@ mod tests {
         let mut k = Kernel::default();
         let b = ap::create_torus(&mut k, Point3::ZERO, 3.0, 1.0).unwrap();
         let s = Surface::from(ap::create_torus_surface(&k, Point3::ZERO, 3.0, 1.0).unwrap());
-        given_its_own(k, b, s, 2.0 * std::f64::consts::PI.powi(2) * 3.0);
+        given_its_own(k, b, s, 2.0 * det::powi(std::f64::consts::PI, 2) * 3.0);
     }
 
     /// A whole torus's one face, meeting only itself across its seams, given the coaxial
@@ -2713,7 +3327,7 @@ mod tests {
         .unwrap();
         let (v, manifold) = volume_and_manifold(&k, &mut b);
         assert!(manifold);
-        let want = 2.0 * std::f64::consts::PI.powi(2) * 3.0 * 1.5 * 1.5;
+        let want = 2.0 * det::powi(std::f64::consts::PI, 2) * 3.0 * 1.5 * 1.5;
         assert!((v - want).abs() <= 1e-6 * want, "{v} vs {want}");
         assert_eq!(
             (b.faces().len(), b.edges().len(), b.vertices().len()),
@@ -3173,7 +3787,7 @@ mod tests {
             ("turned piece", |k| {
                 use crate::geom::axis2_placement::Axis2Placement;
                 let (b, piece) = split_block_piece(k);
-                let (c, sn) = (0.02_f64.cos(), 0.02_f64.sin());
+                let (c, sn) = (det::cos(0.02_f64), det::sin(0.02_f64));
                 let pivot = Point3::new(30.0, 0.0, 20.0);
                 let turned = Point3::new(
                     c * pivot.x + sn * pivot.z,
@@ -3815,7 +4429,7 @@ mod tests {
 
     /// `∫ √(R² − u²) du` from 0 to `u`.
     fn quarter_disc_area(radius: f64, u: f64) -> f64 {
-        0.5 * (u * (radius * radius - u * u).sqrt() + radius * radius * (u / radius).asin())
+        0.5 * (u * (radius * radius - u * u).sqrt() + radius * radius * det::asin(u / radius))
     }
 
     /// The fix sets the tangent-edge cases run with: none (the kernel's default) and every
@@ -4041,5 +4655,65 @@ mod tests {
             matches!(why, Some(OffsetFailure::Unsound { .. })),
             "{why:?}"
         );
+    }
+
+    /// #22804: moving the flat face of a half-torus outward (across the torus's `v = 0°`
+    /// tube seam) and inward builds a clean 2-face manifold solid at the exact Pappus
+    /// volume, for both upper (`z ≥ 0`) and lower (`z ≤ 0`) half-tori.
+    #[test]
+    fn a_half_toruss_flat_face_moves_outward_across_the_tube_seam() {
+        use crate::boolean::api_brep::boolean_difference;
+        use crate::offset::offset_faces::OffsetFacesExecutive;
+        use crate::primitive::api_primitives::create_torus;
+        use crate::topology::brep::validation::{check_brep, CheckLevel};
+
+        let (major, minor) = (15.0_f64, 4.0_f64);
+        let pi = crate::math::PI;
+        let expected_volume = |d: f64| -> f64 {
+            let half = pi * pi * major * minor * minor;
+            let slice = 2.0
+                * pi
+                * major
+                * (d * (minor * minor - d * d).sqrt() + minor * minor * det::asin(d / minor));
+            half + slice
+        };
+
+        for (cut_z, distance) in [(-5.0, 2.0), (-5.0, -2.0), (0.0, 2.0)] {
+            let mut k = Kernel::default();
+            let torus = create_torus(&mut k, Point3::ZERO, major, minor).unwrap();
+            let box_cut =
+                create_box(&mut k, Point3::new(-20.0, -20.0, cut_z), 40.0, 40.0, 5.0).unwrap();
+            let mut b = boolean_difference(&mut k, torus, box_cut).unwrap();
+            let flat = bp1::faces(&b, None)
+                .unwrap()
+                .into_iter()
+                .find(|&f| {
+                    matches!(
+                        b.face(f).unwrap().surface.as_ref().unwrap().kind(),
+                        SurfaceKind::Plane(_)
+                    )
+                })
+                .unwrap();
+
+            OffsetFacesExecutive::new()
+                .offset_faces(&mut k, &mut b, &[flat], distance)
+                .unwrap_or_else(|e| panic!("cut_z={cut_z}, distance={distance}: {e:?}"));
+
+            assert_eq!(bp1::faces(&b, None).unwrap().len(), 2);
+            let (v, manifold) = volume_and_manifold(&k, &mut b);
+            let want = expected_volume(distance);
+            assert!(
+                manifold && (v - want).abs() < 1e-3,
+                "cut_z={cut_z}, distance={distance}: manifold={manifold}, {v} vs {want}"
+            );
+            b.use_arena_naming().unwrap();
+            let lines = check_brep(&mut k, &mut b, CheckLevel::Level2)
+                .unwrap()
+                .lines();
+            assert!(
+                lines.is_empty(),
+                "cut_z={cut_z}, distance={distance}: {lines:?}"
+            );
+        }
     }
 }

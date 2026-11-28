@@ -43,6 +43,7 @@ use solidcore::geom::tol::zone_tol3d;
 use solidcore::intersect::point_class::PointClassType;
 use solidcore::mass::enclosure::{enclose_face_area_relative, enclose_volume};
 use solidcore::mass::integrator::properties::face_properties;
+use solidcore::math::det;
 use solidcore::math::Vec3;
 use solidcore::nurbs::b_spline_surface::BSplineSurface;
 use solidcore::nurbs::b_spline_surface_n_lib::p2::OrientType;
@@ -355,7 +356,7 @@ fn gauss(n: usize) -> Vec<(f64, f64)> {
     (1..=n)
         .map(|i| {
             let nf = n as f64;
-            let mut x = (std::f64::consts::PI * (i as f64 - 0.25) / (nf + 0.5)).cos();
+            let mut x = det::cos(std::f64::consts::PI * (i as f64 - 0.25) / (nf + 0.5));
             let mut dp = 1.0;
             for _ in 0..100 {
                 let (mut p0, mut p1) = (1.0, x);
@@ -564,8 +565,8 @@ fn plane_polygon_area(b: &Brep) -> f64 {
         pts.iter().map(|p| p[c]).sum::<f64>() / m,
     );
     pts.sort_by(|p, q| {
-        let ap = (p[c] - cc).atan2(p[a] - ca);
-        let aq = (q[c] - cc).atan2(q[a] - ca);
+        let ap = det::atan2(p[c] - cc, p[a] - ca);
+        let aq = det::atan2(q[c] - cc, q[a] - ca);
         ap.total_cmp(&aq)
     });
     let mut twice = 0.0;
@@ -1193,8 +1194,8 @@ fn box_w_slot_volume_and_mass_are_those_their_trims_bound() {
     // (WR-450, #18923: the faces whose recognised analytic is not their B-spline's
     // parameterisation keep an exact copy, so the integrator runs on the file's B-splines
     // there; the row moved by 1 to 6 ulps, at most 7.1e-16 relative, in area, cy, Ix, Pyz,
-    // Pzx and Pxy (the goldens' `fillet_executive_p3` row `source-file-box_w_slot-all-edges`
-    // in `wr450_rows`). The reference checks below hold it as they held main's.)
+    // Pzx and Pxy (the goldens' `fillet_executive_p3` row `source-file-box_w_slot-all-edges`).
+    // The reference checks below hold it as they held main's.)
     let new_row = [
         5.9143900085495815,
         0.6807481066067114,

@@ -38,6 +38,7 @@ use solidcore::topology::{
 use solidcore::{EntityRef, SolidError};
 
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
+use solidcore::math::det;
 
 /// The unit runner.
 pub struct Runner;
@@ -469,7 +470,7 @@ fn turn(rng: &mut Rng, d: [f64; 3], deg: f64) -> [f64; 3] {
     let ([d0, d1, d2], [r0, r1, r2]) = (d, r);
     let dot = d0 * r0 + d1 * r1 + d2 * r2;
     let [p0, p1, p2] = unit3([r0 - dot * d0, r1 - dot * d1, r2 - dot * d2]);
-    let (c, sn) = (deg.to_radians().cos(), deg.to_radians().sin());
+    let (c, sn) = (det::cos(deg.to_radians()), det::sin(deg.to_radians()));
     unit3([c * d0 + sn * p0, c * d1 + sn * p1, c * d2 + sn * p2])
 }
 
@@ -1019,8 +1020,8 @@ fn own_brep(i: &Inputs) -> Result<crate::own_builder::RustBrep<OwnBrep>, Harness
 type OwnBrep = (Brep, Option<i64>, [usize; 10]);
 
 /// What a `Gaps` case computes, for the convex hull certificate of the vertex row
-/// `surf_sphere150_rebuild_v3_gaps` (`refit::replay::vertex_gap`): the B-rep the case builds, the vertex, the largest gap it holds and
-/// every gap it lists, made as [`run_rust`] makes them (on [`crate::runner_kernel`]s).
+/// `surf_sphere150_rebuild_v3_gaps` (`largest_gap`): the B-rep the case builds, the vertex,
+/// the largest gap it holds and every gap it lists, made as [`run_rust`] makes them (on [`crate::runner_kernel`]s).
 ///
 /// # Panics
 ///
@@ -1498,3 +1499,7 @@ impl UnitDiff for Runner {
         serde_json::to_value(i).ok()
     }
 }
+
+#[cfg(test)]
+#[path = "topology_vertex/largest_gap.rs"]
+mod largest_gap;

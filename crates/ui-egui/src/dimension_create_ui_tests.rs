@@ -2214,6 +2214,75 @@ fn double_clicking_another_shown_dimension_opens_it_from_the_model_view() {
     crate::dim_view::cancel();
 }
 
+/// The plate of [`shown_dimensions`] as a design leaves it: the extruded sketch hidden, no
+/// dimensions shown. Returns the harness and the extrude's id.
+fn plate_without_dimensions() -> (Harness, u64) {
+    let (mut h, sketch) = shown_dimensions();
+    crate::browser::set_sketch_visible(&mut h.app, sketch, false);
+    h.app.session.visibility.shown_dimensions.clear();
+    h.settle();
+    assert!(crate::dim_view::model_drawn().is_empty());
+    let extrude = h.app.session.doc.features.last().unwrap().id;
+    (h, extrude)
+}
+
+/// Run the Edit Dimensions entry of a menu.
+fn edit_dimensions(h: &mut Harness, items: &[crate::ui_kit::Item]) {
+    let item = items.iter().find(|i| i.id == "ui.editDimensions").expect("the menu has Edit Dimensions");
+    assert!(item.enabled);
+    crate::context_menu::run_item(&mut h.app, item, egui::pos2(0.0, 0.0));
+    h.settle();
+}
+
+/// Edit Dimensions on a feature shows its used-up sketch's dimensions for now (#6642): nothing
+/// is saved and no undo step is added. Several values can be changed one after the other, each
+/// one undo step, and Esc hides the dimensions again.
+#[test]
+fn edit_dimensions_on_a_feature_shows_its_sketch_dimensions_until_esc() {
+    let (mut h, extrude) = plate_without_dimensions();
+    let saved = h.app.session.doc.to_json();
+    let undo = h.app.session.undo.len();
+    let items = crate::context_menu::items(&h.app, &crate::context_menu::Target::Feature { id: extrude });
+    edit_dimensions(&mut h, &items);
+    assert_eq!(crate::dim_view::model_drawn().len(), 2, "both dimensions are shown");
+    assert_eq!(h.app.session.doc.to_json(), saved, "showing them is not saved in the design");
+    assert_eq!(h.app.session.undo.len(), undo, "showing them is no undo step");
+    for (param, value, max) in [("d2", "14", [20.0, 14.0]), ("d1", "30", [30.0, 14.0])] {
+        let at = model_text(&h, param);
+        h.step(&json!({"click":at,"double":true})).unwrap();
+        assert!(crate::dim_view::editing(), "the double-click opens {param}");
+        type_value(&mut h, value);
+        h.step(&json!({"key":"Enter"})).unwrap();
+        h.settle();
+        assert_eq!(plate_max(&h), max, "the extrude follows {param}");
+    }
+    assert_eq!(h.app.session.undo.len(), undo + 2, "one undo step per value");
+    assert_eq!(h.app.session.active_sketch, None, "the sketch is not edited");
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.settle();
+    assert!(crate::dim_view::model_drawn().is_empty(), "Esc hides them");
+    assert_eq!(h.app.viewport.edit_dimensions, None);
+}
+
+/// The timeline row's Edit Dimensions does the same; a click on empty space or the start of a
+/// command hides the dimensions, and Show Dimension's own list is left alone.
+#[test]
+fn edit_dimensions_hide_on_a_click_on_empty_space_or_a_command() {
+    let (mut h, extrude) = plate_without_dimensions();
+    let items = crate::timeline::feature_items(&h.app, extrude);
+    edit_dimensions(&mut h, &items);
+    assert_eq!(crate::dim_view::model_drawn().len(), 2);
+    h.step(&json!({"click":{"world":[-15.0, 25.0, 0.0]}})).unwrap();
+    h.settle();
+    assert!(crate::dim_view::model_drawn().is_empty(), "a click on empty space hides them");
+    edit_dimensions(&mut h, &items);
+    assert_eq!(crate::dim_view::model_drawn().len(), 2);
+    h.app.start("solid.fillet");
+    h.settle();
+    assert!(crate::dim_view::model_drawn().is_empty(), "a command hides them");
+    assert!(h.app.session.visibility.shown_dimensions.is_empty());
+}
+
 /// A sketch seen nearly edge-on, with one of its directions pointing at the eye, keeps its
 /// dimensions near the sketch: shown on a finished sketch (Show Dimensions) and on the sketch
 /// being edited. The text sizes in millimetres came from that foreshortened direction alone, so
@@ -2780,4 +2849,143 @@ fn reference_pick_and_slight_drag_outside_work_on_dimension_editor() {
     let d2_val = h.app.session.doc.eval(&p2, solidcraft_engine::doc::expr::Kind::Length).unwrap();
     assert!((d2_val - 25.0).abs() < 1e-6, "expected accepted value 25, got {d2_val}");
     crate::dim_view::cancel();
+}
+
+/// A 20 mm line near the top of the drawable area: room below its dimension's text whatever
+/// panels dock around the view.
+fn roomy_line() -> Harness {
+    let mut h = line([20., 0.]);
+    h.call("ui.resize", json!({"width": 1400.0, "height": 1100.0}));
+    h.settle();
+    near_top(&mut h, 0.0);
+    h
+}
+
+/// Pans the view so world `y` sits just below the top of the drawable area.
+fn near_top(h: &mut Harness, y: f64) {
+    let top = h.app.viewport.layout.as_ref().map(|l| l.drawable).or(h.app.viewport.rect).expect("a view").top();
+    let (at, up) = (screen(h, [0., y]), screen(h, [0., y + 1.]));
+    h.app.cam.target.y += (at.y - (top + 60.0)) as f64 / (up.y - at.y) as f64;
+    h.settle();
+}
+
+fn box_rect(h: &Harness) -> egui::Rect {
+    h.ctx.memory(|m| m.area_rect(egui::Id::unique("sc_dim_edit_area"))).expect("the value box is drawn")
+}
+
+fn screen(h: &mut Harness, world: [f64; 2]) -> egui::Pos2 {
+    let p = h.call("ui.worldToScreen", json!({"points": [[world[0], world[1], 0]]}))["result"][0].clone();
+    egui::pos2(p[0].as_f64().unwrap() as f32, p[1].as_f64().unwrap() as f32)
+}
+
+/// A placed dimension's box opens beside its text, clear of the line. Its name line drags it
+/// while the value keeps the keyboard; the next box opens beside its own text.
+#[test]
+fn a_placed_dimension_box_opens_beside_its_text_and_keeps_where_it_was_dragged() {
+    let mut h = roomy_line();
+    place(&mut h, &[[10., 0.]], [10., -6.]);
+    h.frames(3);
+    let text = screen(&mut h, [10., -6.]);
+    let (a, b) = (screen(&mut h, [0., 0.]), screen(&mut h, [20., 0.]));
+    let first = box_rect(&h);
+    assert!(!first.expand(2.0).contains(text), "the box is beside its text, not over it: {first:?} {text:?}");
+    let line_band = egui::Rect::from_two_pos(a, b).expand(2.0);
+    assert!(!first.intersects(line_band), "the box is clear of the measured line: {first:?} {line_band:?}");
+    let name = h.app.session.doc.next_d_name();
+    let grip = h.widget(&format!("Dimension: {name}")).expect("the box's name line");
+    h.step(&json!({"drag": [grip, [grip[0] + 60.0, grip[1] + 40.0]], "steps": 8})).unwrap();
+    h.frames(3);
+    assert!(crate::dim_view::editing(), "dragging the box keeps it open");
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(egui::Id::unique("sc_dim_edit")), "the value keeps the keyboard");
+    let dragged = box_rect(&h);
+    let by = dragged.min - first.min;
+    assert!((by - egui::vec2(60.0, 40.0)).length() < 2.0, "moved with the pointer: {by:?}");
+    assert!((crate::dim_view::moved(&h.ctx) - egui::vec2(60.0, 40.0)).length() < 2.0);
+    type_value(&mut h, "12");
+    h.step(&json!({"key": "Enter"})).unwrap();
+    assert!(!crate::dim_view::editing());
+    assert_eq!(h.app.session.doc.param(&name).unwrap().expr, "12", "the value typed after the drag applies");
+    // The next box opens beside its own text, as the first did before it was dragged.
+    h.frames(40);
+    h.app.run("sketch.line", json!({"points":[[0,-10],[12,-10]],"infer":false})).unwrap();
+    h.settle();
+    near_top(&mut h, -10.);
+    place(&mut h, &[[6., -10.]], [6., -14.]);
+    h.frames(3);
+    let next = box_rect(&h).min - screen(&mut h, [6., -14.]);
+    let was = first.min - text;
+    assert!((next - was).length() < 3.0, "opens beside its text, not where the last was dropped: {next:?} vs {was:?}");
+}
+
+/// The dimension window's name line drags it too; a new window opens beside its own dimension.
+#[test]
+fn the_dimension_window_drags_by_its_name_and_remembers_it() {
+    let mut h = roomy_line();
+    h.app.preferences.dimension_input = crate::prefs::DimensionInput::Window;
+    place(&mut h, &[[10., 0.]], [10., -6.]);
+    h.frames(3);
+    let area = || egui::Id::unique("sc_dim_window");
+    let first = h.ctx.memory(|m| m.area_rect(area())).expect("the window is drawn");
+    let name = h.app.session.doc.next_d_name();
+    let grip = h.widget(&format!("Dimension: {name}")).expect("the window's name line");
+    h.step(&json!({"drag": [grip, [grip[0] - 50.0, grip[1] + 30.0]], "steps": 8})).unwrap();
+    h.frames(3);
+    assert!(crate::dim_view::editing(), "dragging the window keeps it open");
+    let by = h.ctx.memory(|m| m.area_rect(area())).unwrap().min - first.min;
+    assert!((by - egui::vec2(-50.0, 30.0)).length() < 2.0, "moved with the pointer: {by:?}");
+    assert!((crate::dim_view::moved(&h.ctx) - egui::vec2(-50.0, 30.0)).length() < 2.0);
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(3);
+    assert!(!crate::dim_view::editing());
+    assert_eq!(crate::dim_view::moved(&h.ctx), egui::Vec2::ZERO, "closed: the next window opens beside its dimension");
+}
+
+/// One frame in which `key` is pressed, with no frame of its own before or after it.
+fn press(h: &mut Harness, key: egui::Key) {
+    h.frame_with(vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+}
+
+/// Where the value box or window `area` opens on dimension `name` when nothing was dragged:
+/// opened after a few frames with none.
+fn fresh_editor(h: &mut Harness, name: &str, area: egui::Id) -> egui::Rect {
+    crate::dim_view::cancel();
+    h.frames(5);
+    crate::dim_view::edit_param(&h.app, name);
+    h.frames(3);
+    h.ctx.memory(|m| m.area_rect(area)).expect("the editor is drawn")
+}
+
+/// #22388: a dragged dimension value box, or window, keeps its place only while it is open. Applied
+/// with Enter and followed on the very next frame by the next one, the next opens beside its own
+/// dimension, not where the last was dropped.
+#[test]
+fn a_dragged_dimension_editor_is_forgotten_when_the_next_opens_on_the_next_frame() {
+    for window in [false, true] {
+        let mut h = roomy_line();
+        if window {
+            h.app.preferences.dimension_input = crate::prefs::DimensionInput::Window;
+        }
+        let area = egui::Id::unique(if window { "sc_dim_window" } else { "sc_dim_edit_area" });
+        place(&mut h, &[[10., 0.]], [10., -6.]);
+        h.frames(3);
+        let first = h.ctx.memory(|m| m.area_rect(area)).expect("the editor is drawn");
+        let name = h.app.session.doc.next_d_name();
+        let grip = h.widget(&format!("Dimension: {name}")).expect("the editor's name line");
+        h.step(&json!({"drag": [grip, [grip[0] + 60.0, grip[1] + 40.0]], "steps": 8})).unwrap();
+        h.frames(3);
+        let by = h.ctx.memory(|m| m.area_rect(area)).unwrap().min - first.min;
+        assert!((by - egui::vec2(60.0, 40.0)).length() < 2.0, "window {window}: dragged: {by:?}");
+        type_value(&mut h, "12");
+        press(&mut h, egui::Key::Enter);
+        assert!(!crate::dim_view::editing(), "window {window}: Enter applies");
+        assert_eq!(h.app.session.doc.param(&name).unwrap().expr, "12");
+        // The next editor opens on the very next frame.
+        crate::dim_view::edit_param(&h.app, &name);
+        h.frames(3);
+        assert!(crate::dim_view::editing(), "window {window}: the next editor opens");
+        let next = h.ctx.memory(|m| m.area_rect(area)).expect("the next editor is drawn");
+        let own = fresh_editor(&mut h, &name, area);
+        assert!((next.min - own.min).length() < 1.0, "window {window}: opens beside its dimension {own:?}, not where the last was dropped: {next:?}");
+        crate::dim_view::cancel();
+    }
 }

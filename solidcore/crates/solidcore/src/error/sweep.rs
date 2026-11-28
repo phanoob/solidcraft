@@ -14,6 +14,7 @@
 //! | [`SweepFailure::Defect`]              | `SM_ERR` (or the site's, through `with_status`) |
 //! | [`SweepFailure::EdgeWithoutCurve`]    | `SM_ERR_NULL_POINTER` (or the site's) |
 //! | [`SweepFailure::FaceCopyByFullTurn`]  | `SM_ERR_NULL_POINTER`    |
+//! | [`SweepFailure::FaceSweptIntoBody`]   | `SM_ERR`                 |
 //! | [`SweepFailure::FaceWithoutSurface`]  | `SM_ERR_NULL_POINTER`    |
 //! | [`SweepFailure::LoftMatchTooLarge`]   | `SM_ERR`                 |
 //! | [`SweepFailure::LoftSectionsTooLarge`] | `SM_ERR`                |
@@ -147,6 +148,20 @@ pub enum SweepFailure {
     /// A face to copy by a rotation of a full turn: its image is the face itself, so the
     /// rotation gives no surface to copy. [`ErrorKind::InvalidInput`].
     FaceCopyByFullTurn,
+    /// A planar face of a solid that a non-manifold sweep was asked to sweep into the
+    /// B-rep's infinite region is moved into the body instead: the translation carries it
+    /// `depth` against its outward normal, more than the `tolerance`. The swept solid would
+    /// lie inside the body, its sides on the body's own faces (#21673). Sweeping it the
+    /// other way, along its outward normal, builds. [`ErrorKind::InvalidInput`]. A refusal
+    /// of solidcore's own: upstream returns success with that body.
+    FaceSweptIntoBody {
+        /// The face.
+        face: FaceId,
+        /// How far the translation moves it against its outward normal.
+        depth: f64,
+        /// The B-rep's tolerance.
+        tolerance: f64,
+    },
     /// Two vertices of the face a base edge is made in are within tolerance of one end of
     /// the edge's curve. [`ErrorKind::InvalidInput`].
     FaceVerticesCoincide,
@@ -265,6 +280,12 @@ pub enum SweepFailure {
     /// The surface an edge sweeps has no boundary curves left to trim it.
     /// [`ErrorKind::Degenerate`].
     SweptFaceWithoutBoundary,
+    /// A wall an exact path sweep builds has a natural boundary within tolerance of
+    /// singular but not exactly singular, which surface test 5 refuses (a corner arc
+    /// whose inner radius is inside the approximation tolerance). A caller sweeping a
+    /// closed path of lines and arcs builds that wall piece by piece at the true offset.
+    /// [`ErrorKind::Degenerate`].
+    SweptWallNearlySingular,
     /// The plane a line perpendicular to the axis sweeps and the revolution of that line
     /// have normals whose cosine is `dot`, below 0.8 in size, at their domains' first
     /// corners. [`ErrorKind::Degenerate`].
@@ -310,6 +331,7 @@ impl SweepFailure {
             | Self::EdgeCrossesRotationAxis
             | Self::EdgeEndsOffCurve { .. }
             | Self::FaceAlreadySwept
+            | Self::FaceSweptIntoBody { .. }
             | Self::FaceVerticesCoincide
             | Self::LoftMatchTooLarge { .. }
             | Self::LoftSectionsTooLarge { .. }
@@ -325,7 +347,8 @@ impl SweepFailure {
             | Self::SweepTooShort { .. }
             | Self::SweptBodyNotManifoldSolid
             | Self::SweptFaceWithoutBoundary
-            | Self::SweptSurfaceNormalsDisagree { .. } => SM_ERR,
+            | Self::SweptSurfaceNormalsDisagree { .. }
+            | Self::SweptWallNearlySingular => SM_ERR,
             Self::BrepWithoutInfiniteRegion { .. }
             | Self::EdgeWithoutCurve { .. }
             | Self::FaceCopyByFullTurn
@@ -351,6 +374,7 @@ impl SweepFailure {
             | Self::EdgeWithoutCurve { .. }
             | Self::FaceAlreadySwept
             | Self::FaceCopyByFullTurn
+            | Self::FaceSweptIntoBody { .. }
             | Self::FaceVerticesCoincide
             | Self::FaceWithoutSurface { .. }
             | Self::MergeOtherBodyConsumed
@@ -376,7 +400,8 @@ impl SweepFailure {
             | Self::RevolutionSweepsNoFace
             | Self::SweptEdgeCurveDropped
             | Self::SweptFaceWithoutBoundary
-            | Self::SweptSurfaceNormalsDisagree { .. } => ErrorKind::Degenerate,
+            | Self::SweptSurfaceNormalsDisagree { .. }
+            | Self::SweptWallNearlySingular => ErrorKind::Degenerate,
             Self::Defect { .. } => ErrorKind::StageFailed,
             Self::ProfileCurveStepFailed { .. } => ErrorKind::Failed,
             Self::RailPastStationCap { .. } => ErrorKind::NotWithinTolerance,
@@ -384,9 +409,9 @@ impl SweepFailure {
     }
 
     /// True for a failure that replaced a C++ status the routine returns (every cause but
-    /// a loft's own refusals): it answers with that status the way the `Upstream` it
-    /// replaced did ([`crate::error::upstream_status`]). A loft's refusal is solidcore's own
-    /// and replaced none.
+    /// a loft's own refusals and a face swept into its body): it answers with that status
+    /// the way the `Upstream` it replaced did ([`crate::error::upstream_status`]). Those
+    /// refusals are solidcore's own and replaced none.
     #[must_use]
     pub const fn replaces_upstream_status(&self) -> bool {
         !matches!(
@@ -394,6 +419,7 @@ impl SweepFailure {
             Self::RailPastStationCap { .. }
                 | Self::LoftSectionsTooLarge { .. }
                 | Self::LoftMatchTooLarge { .. }
+                | Self::FaceSweptIntoBody { .. }
         )
     }
 }
@@ -474,6 +500,15 @@ impl core::fmt::Display for SweepFailure {
             ),
             Self::MergeOtherBodyConsumed => f.write_str(MERGE_OTHER_CONSUMED),
             Self::FaceAlreadySwept => f.write_str("the face was already swept"),
+            Self::FaceSweptIntoBody {
+                face,
+                depth,
+                tolerance,
+            } => write!(
+                f,
+                "face {} is swept into its own body, {depth:e} against its outward normal (more than {tolerance:e}), not into the infinite region",
+                face.index()
+            ),
             Self::SweepImageOfOtherKind {
                 image,
                 expected,
@@ -545,6 +580,9 @@ impl core::fmt::Display for SweepFailure {
             ),
             Self::SweptFaceWithoutBoundary => {
                 f.write_str("the surface the edge sweeps has no boundary curves")
+            }
+            Self::SweptWallNearlySingular => {
+                f.write_str("a swept wall is within tolerance of singular at its boundary")
             }
             Self::SweptEdgeCurveDropped => {
                 f.write_str("the face builder dropped the swept edge's own curve")
@@ -810,6 +848,11 @@ mod tests {
                 ErrorKind::Degenerate,
             ),
             (
+                SweepFailure::SweptWallNearlySingular,
+                SM_ERR,
+                ErrorKind::Degenerate,
+            ),
+            (
                 SweepFailure::SweptEdgeCurveDropped,
                 SM_ERR_NULL_POINTER,
                 ErrorKind::Degenerate,
@@ -868,6 +911,27 @@ mod tests {
             "sweep::op: the face was already swept"
         );
         assert_eq!(SolidError::sm_err("sweep::op").sweep_failure(), None);
+    }
+
+    /// A face swept into its own body (#21673) is a refusal of solidcore's own: status
+    /// `SM_ERR`, class `invalid_input`, and no upstream status (upstream returns success).
+    #[test]
+    fn a_face_swept_into_its_body_is_solidcores_own_refusal() {
+        let into = SweepFailure::FaceSweptIntoBody {
+            face: FaceId::from_index(0),
+            depth: 5.0,
+            tolerance: 1e-6,
+        };
+        let e = SolidError::sweep("sweep::op", into);
+        assert_eq!(e.sm_status(), Some(SM_ERR));
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert_eq!(e.upstream_status(), None);
+        assert!(!into.replaces_upstream_status());
+        assert_eq!(e.sweep_failure(), Some(&into));
+        assert_eq!(
+            e.to_string(),
+            "sweep::op: face 0 is swept into its own body, 5e0 against its outward normal (more than 1e-6), not into the infinite region"
+        );
     }
 
     /// A railed loft's refusal reports what it reported before the sweep routines' failures

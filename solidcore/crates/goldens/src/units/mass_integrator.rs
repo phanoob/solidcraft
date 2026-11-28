@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solidcore::mass::integrator::{integrate, OdeIntegrator, OdeOptions};
 use solidcore::SolidError;
+use solidcore::math::det;
 
 /// Runner for `mass.integrator`.
 pub struct Runner;
@@ -33,8 +34,8 @@ fn eval(i: &Input, t: f64, y: &[f64], dy: &mut [f64]) -> solidcore::Result<()> {
             return Err(SolidError::sm_err("test evaluator"));
         }
         *d = match i.kind {
-            1 => p[0] * (p[1] * t + p[2]).sin() + p[3] * v,
-            2 => p[0] * (p[1] * t).exp() + p[2] * v + p[3],
+            1 => p[0] * det::sin(p[1] * t + p[2]) + p[3] * v,
+            2 => p[0] * det::exp(p[1] * t) + p[2] * v + p[3],
             _ => p[0] + p[1] * t + p[2] * t * t + p[3] * v,
         };
     }
@@ -438,43 +439,6 @@ pub fn face_model(
     Ok((fk, brep, face, dom))
 }
 
-/// A `face` geometry case's face model ([`face_model`]) with the case's parameters and
-/// query (#18325's certificates, `tests/issue_18325_moved_rows.rs`); `None` for any other
-/// case.
-///
-/// # Errors
-///
-/// A case that does not parse, or a failed construction.
-#[allow(clippy::type_complexity)] // the model and the case's own fields
-pub fn face_scene(
-    case: &Case,
-) -> Result<
-    Option<(
-        solidcore::kernel::Kernel,
-        solidcore::topology::Brep,
-        solidcore::topology::FaceId,
-        [f64; 16],
-        i32,
-    )>,
-    HarnessError,
-> {
-    let Some(g) = case.inputs.get("geometry") else {
-        return Ok(None);
-    };
-    let g: Geometry =
-        serde_json::from_value(g.clone()).map_err(|e| HarnessError::new(e.to_string()))?;
-    let Geometry::Face {
-        kind,
-        parameters,
-        query,
-    } = g
-    else {
-        return Ok(None);
-    };
-    let (k, b, f, _) =
-        face_model(kind, &parameters).map_err(|e| HarnessError::new(e.to_string()))?;
-    Ok(Some((k, b, f, parameters, query)))
-}
 fn geometry_rust(g: &Geometry) -> Output {
     use solidcore::curve::curve::Curve;
     use solidcore::geom::extent1d::Extent1d;

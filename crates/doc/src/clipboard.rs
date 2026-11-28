@@ -476,6 +476,9 @@ impl crate::Feature {
                 for n in sketch.dimension_params_mut().into_iter().flatten() {
                     mapped_name(n, parameters);
                 }
+                for n in sketch.driven_dimension_params_mut().into_iter().flatten() {
+                    mapped_name(n, parameters);
+                }
                 for e in sketch.text_exprs_mut() {
                     *e = clone_expression(e, parameters);
                 }
@@ -551,10 +554,33 @@ impl crate::Feature {
             K::Align { from_frame, to_frame, .. } => {
                 for fr in [from_frame, to_frame].into_iter().flatten() {
                     if let crate::AlignFrame::Origin { origin } = fr {
+                        if let Some(sk) = origin.snap.sketch_feature_mut()
+                            && let Some(&mapped) = ids.get(sk)
+                        {
+                            *sk = mapped;
+                        }
                         for n in origin.snap.face_names_mut() {
                             *n = remap_topology(n, ids, bodies);
                         }
                     }
+                }
+            }
+            K::CapturePosition { moves, joints } => {
+                let occurrences = placements.map(|p| p.occurrences);
+                for m in moves {
+                    if let Some(&mapped) = occurrences.and_then(|o| o.get(&m.occurrence)) {
+                        m.occurrence = mapped;
+                    }
+                    if let Some(path) = &mut m.path {
+                        for id in path {
+                            if let Some(&mapped) = occurrences.and_then(|o| o.get(id)) {
+                                *id = mapped;
+                            }
+                        }
+                    }
+                }
+                for e in joints.iter_mut().flat_map(|j| j.exprs.iter_mut()).flatten() {
+                    *e = clone_expression(e, parameters);
                 }
             }
             _ => {}
